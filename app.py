@@ -376,7 +376,13 @@ def oauth_start():
         states[state] = {"ts": int(time.time()), "subdomain": subdomain}
         _states_set(states)
 
-        params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "post_message"}
+        params = {
+        "client_id": AMO_CLIENT_ID,
+        "redirect_uri": AMO_REDIRECT_URI,
+        "response_type": "code",
+        "state": state,
+        "mode": "post_message",
+    }
         url = _amo_auth_host() + "/oauth?" + urlencode(params)
 
         log_event("oauth_start", {"subdomain": subdomain, "state": state})
@@ -452,70 +458,75 @@ def oauth_redirect():
     return Response(html, mimetype="text/html")
 
 
-@app.post("/oauth/callback")
+@app.route("/oauth/callback", methods=["GET", "POST"])
 def oauth_callback():
     """
-    Receives {code, state, referer} from /oauth/redirect and exchanges code -> tokens.
+    OAuth redirect/callback handler.
+
+    In amoCRM OAuth with mode=post_message, the redirect page can be opened with GET
+    parameters (?code=...&state=...). In some cases amoCRM can also send POST JSON.
+    We support both to avoid 405 Method Not Allowed.
     """
     try:
-        data = request.get_json(silent=True) or {}
-        code = (data.get("code") or "").strip()
-        state = (data.get("state") or "").strip()
-        referer = (data.get("referer") or "").strip()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            code = (data.get("code") or "").strip()
+            state = (data.get("state") or "").strip()
+        else:
+            code = (request.args.get("code") or "").strip()
+            state = (request.args.get("state") or "").strip()
 
         if not code:
+            log_event("oauth_callback_missing_code", {"method": request.method})
             return jsonify({"ok": False, "error": "missing_code"}), 400
 
-        missing = _require_oauth_env()
-        if missing:
-            return jsonify({"ok": False, "error": "missing_oauth_env", "missing": missing}), 400
+        # Determine subdomain from saved state
+        subdomain = None
+        states = _states_get()
+        if state and state in states:
+            subdomain = (states[state].get("subdomain") or "").strip()
+            # one-time use
+            states.pop(state, None)
+            _states_put(states)
 
-        subdomain = _parse_subdomain_from_referer(referer)
-        # If state present, prefer stored subdomain from state
-        if state:
-            states = _states_get()
-            s = states.get(state)
-            if s and s.get("subdomain"):
-                subdomain = s["subdomain"]
+        # Fallback: try to infer from Referer (meawake.amocrm.ru)
+        if not subdomain:
+            subdomain = _infer_subdomain_from_request()
 
         if not subdomain:
-            # last attempt: user can pass it explicitly
-            subdomain = (data.get("subdomain") or "").strip()
+            log_event("oauth_callback_unknown_subdomain", {"state": state, "method": request.method})
+            return jsonify({"ok": False, "error": "unknown_subdomain"}), 400
 
-        if not subdomain:
-            return jsonify({"ok": False, "error": "cannot_detect_subdomain", "details": "No subdomain in referer/state"}), 400
+        # Exchange code -> token
+        token = _amo_token_exchange(code=code, subdomain=subdomain)
 
-        tok = _amo_token_exchange(code)
-        now = int(time.time())
+        # Save token
         tokens = _tokens_get()
-        tokens[subdomain] = {
-            "access_token": tok.get("access_token", ""),
-            "refresh_token": tok.get("refresh_token", ""),
-            "expires_at": now + int(tok.get("expires_in", 0)),
-            "token_type": tok.get("token_type", ""),
-            "scope": tok.get("scope", ""),
-            "created_at": now,
-        }
-        _tokens_set(tokens)
+        tokens[subdomain] = token
+        _tokens_put(tokens)
 
-        log_event("oauth_ok", {"subdomain": subdomain, "referer": referer})
+        log_event("oauth_ok", {"subdomain": subdomain, "referer": request.headers.get("Referer")})
+
+        # For browser: show simple page to close
+        if request.method == "GET":
+            html = f"""<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>Loss Control</title></head>
+<body style="font-family:Arial, sans-serif; padding:24px">
+<h2>Аккаунт подключен ✅</h2>
+<p>Поддомен: <b>{subdomain}</b></p>
+<p>Можно закрыть это окно.</p>
+</body></html>"""
+            return html
 
         return jsonify({"ok": True, "subdomain": subdomain})
-    except requests.HTTPError as e:
-        # show amo error body if possible
-        details = ""
-        try:
-            details = e.response.text
-        except Exception:
-            details = str(e)
-        log_event("oauth_http_error", {"details": details})
-        return jsonify({"ok": False, "error": "amo_http_error", "details": details}), 400
     except Exception as e:
         log_event("oauth_error", {"error": str(e)})
         return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 @app.get("/report/losses")
+
 def report_losses():
     """
     Very MVP endpoint:
