@@ -1,56 +1,84 @@
 import os
 import json
 import time
+import hmac
+import hashlib
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, request, jsonify, redirect, Response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
-# -----------------------------
-# Config
-# -----------------------------
-AMO_CLIENT_ID = os.environ.get("AMO_CLIENT_ID", "").strip()
-AMO_CLIENT_SECRET = os.environ.get("AMO_CLIENT_SECRET", "").strip()
-AMO_REDIRECT_URL = os.environ.get("AMO_REDIRECT_URL", "").strip()
+# ----------------------------
+# Config (env)
+# ----------------------------
+AMO_CLIENT_ID = (os.environ.get("AMO_CLIENT_ID") or "").strip()
+AMO_CLIENT_SECRET = (os.environ.get("AMO_CLIENT_SECRET") or "").strip()
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# People often name it differently. Support both.
+AMO_REDIRECT_URI = (os.environ.get("AMO_REDIRECT_URI") or os.environ.get("AMO_REDIRECT_URL") or "").strip()
 
-# Persistent storage (Render Disk recommended)
-DATA_DIR = os.environ.get("DATA_DIR", "/var/data/loss_control").strip() or "/var/data/loss_control"
-TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")           # per-subdomain tokens
-STATES_FILE = os.path.join(DATA_DIR, "oauth_states.json")     # oauth state -> meta
-EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")          # diagnostics/events
+# Telegram (support both naming styles)
+TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
 
-# -----------------------------
+# Optional: secret for signing cookies / state (can be empty; we still work)
+APP_SECRET = (os.environ.get("APP_SECRET") or "").strip()
+
+# ----------------------------
+# Storage paths
+# ----------------------------
+def _pick_data_dir() -> str:
+    """
+    Render: writable only in /tmp unless you attached a persistent disk (often mounted at /var/data).
+    We'll prefer /var/data/loss_control if writable, else fallback to /tmp/loss_control.
+    """
+    preferred = "/var/data/loss_control"
+    fallback = "/tmp/loss_control"
+    for path in (preferred, fallback):
+        try:
+            os.makedirs(path, exist_ok=True)
+            test = os.path.join(path, ".write_test")
+            with open(test, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test)
+            return path
+        except Exception:
+            continue
+    # last resort: current dir
+    return os.path.join(os.path.dirname(__file__), "data")
+
+DATA_DIR = _pick_data_dir()
+EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")   # {subdomain: {...tokens...}}
+STATES_FILE = os.path.join(DATA_DIR, "states.json")   # {state: {...}}
+
+# In-memory fallbacks (if disk isn't writable for some reason)
+_MEM_TOKENS = {}
+_MEM_STATES = {}
+
+# ----------------------------
 # App
-# -----------------------------
+# ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "loss-control-backend/1.0"})
 
-# -----------------------------
-# Helpers: storage & logs
-# -----------------------------
-def _ensure_dir():
+# ----------------------------
+# Helpers
+# ----------------------------
+def log_event(event_type: str, payload: dict):
+    rec = {"ts": datetime.utcnow().isoformat() + "Z", "event": event_type, "payload": payload}
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
-
-def log_event(event: str, payload: dict):
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, "payload": payload}
-    try:
-        _ensure_dir()
         with open(EVENTS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
+        # Don't break API because of FS issues
         pass
+
 
 def _load_json(path: str, default):
     try:
@@ -59,136 +87,158 @@ def _load_json(path: str, default):
     except Exception:
         return default
 
+
 def _save_json(path: str, data):
-    try:
-        _ensure_dir()
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        return False
+    # atomic-ish save
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-def _read_last_lines(path: str, limit: int = 50):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
-        return [ln.rstrip("\n") for ln in lines]
-    except Exception:
-        return []
 
-# -----------------------------
-# Helpers: amo utils
-# -----------------------------
+def _states_get():
+    # prefer disk, fallback mem
+    data = _load_json(STATES_FILE, None)
+    if isinstance(data, dict):
+        return data
+    return dict(_MEM_STATES)
+
+
+def _states_set(data: dict):
+    # try disk, fallback mem
+    try:
+        _save_json(STATES_FILE, data)
+    except Exception:
+        _MEM_STATES.clear()
+        _MEM_STATES.update(data)
+
+
+def _tokens_get():
+    data = _load_json(TOKENS_FILE, None)
+    if isinstance(data, dict):
+        return data
+    return dict(_MEM_TOKENS)
+
+
+def _tokens_set(data: dict):
+    try:
+        _save_json(TOKENS_FILE, data)
+    except Exception:
+        _MEM_TOKENS.clear()
+        _MEM_TOKENS.update(data)
+
+
 def _amo_auth_host():
-    # For amocrm.ru accounts authorization host is www.amocrm.ru
+    # For your case (amocrm.ru) this is correct.
     return "https://www.amocrm.ru"
 
-def _amo_base_url(subdomain: str):
-    subdomain = (subdomain or "").strip()
-    if not subdomain:
-        raise ValueError("subdomain_required")
-    return f"https://{subdomain}.amocrm.ru"
-
-def _parse_subdomain_from_referer(referer: str):
-    # referer like https://meawake.amocrm.ru/...
-    if not referer:
-        return ""
-    try:
-        host = referer.split("://", 1)[-1].split("/", 1)[0]
-        return host.split(".", 1)[0]
-    except Exception:
-        return ""
 
 def _require_oauth_env():
-    if not AMO_CLIENT_ID or not AMO_CLIENT_SECRET or not AMO_REDIRECT_URL:
-        raise RuntimeError("missing_oauth_env: set AMO_CLIENT_ID, AMO_CLIENT_SECRET, AMO_REDIRECT_URL")
+    missing = []
+    if not AMO_CLIENT_ID:
+        missing.append("AMO_CLIENT_ID")
+    if not AMO_CLIENT_SECRET:
+        missing.append("AMO_CLIENT_SECRET")
+    if not AMO_REDIRECT_URI:
+        missing.append("AMO_REDIRECT_URI (or AMO_REDIRECT_URL)")
+    return missing
 
-def _tokens():
-    return _load_json(TOKENS_FILE, {})
 
-def _save_tokens(all_tokens: dict):
-    return _save_json(TOKENS_FILE, all_tokens)
-
-def _get_token(subdomain: str):
-    return _tokens().get(subdomain)
-
-def _set_token(subdomain: str, token_payload: dict):
-    all_t = _tokens()
-    all_t[subdomain] = token_payload
-    _save_tokens(all_t)
-
-def _is_token_expired(token_payload: dict, skew_sec: int = 60):
+def _parse_subdomain_from_referer(referer: str) -> str:
+    # Example: https://meawake.amocrm.ru/...
     try:
-        expires_at = int(token_payload.get("expires_at", 0))
-        return time.time() >= (expires_at - skew_sec)
+        if not referer:
+            return ""
+        host = referer.split("//", 1)[-1].split("/", 1)[0]
+        if host.endswith(".amocrm.ru"):
+            return host.split(".")[0]
+        return ""
     except Exception:
-        return True
+        return ""
 
-def _refresh_token(subdomain: str, token_payload: dict):
-    _require_oauth_env()
-    refresh_token = token_payload.get("refresh_token")
-    if not refresh_token:
-        raise RuntimeError("no_refresh_token")
-    url = _amo_base_url(subdomain) + "/oauth2/access_token"
-    resp = SESSION.post(
-        url,
-        json={
-            "client_id": AMO_CLIENT_ID,
-            "client_secret": AMO_CLIENT_SECRET,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "redirect_uri": AMO_REDIRECT_URL,
-        },
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"refresh_failed: {resp.status_code} {resp.text}")
-    data = resp.json()
-    # amo returns expires_in (seconds)
-    expires_at = int(time.time()) + int(data.get("expires_in", 0))
-    token_payload = {
-        "access_token": data.get("access_token"),
-        "refresh_token": data.get("refresh_token"),
-        "expires_at": expires_at,
-        "token_type": data.get("token_type", "Bearer"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+
+def _tg_send(text: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return False, "tg_not_configured"
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=15)
+        ok = bool(r.ok)
+        return ok, r.text if not ok else "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def _amo_token_exchange(code: str) -> dict:
+    """
+    Exchange authorization code to access/refresh tokens.
+    """
+    url = _amo_auth_host() + "/oauth2/access_token"
+    payload = {
+        "client_id": AMO_CLIENT_ID,
+        "client_secret": AMO_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": AMO_REDIRECT_URI,
     }
-    _set_token(subdomain, token_payload)
-    return token_payload
+    r = requests.post(url, json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def _get_valid_token(subdomain: str):
-    tok = _get_token(subdomain)
-    if not tok:
+
+def _amo_refresh(refresh_token: str) -> dict:
+    url = _amo_auth_host() + "/oauth2/access_token"
+    payload = {
+        "client_id": AMO_CLIENT_ID,
+        "client_secret": AMO_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "redirect_uri": AMO_REDIRECT_URI,
+    }
+    r = requests.post(url, json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _amo_api_get(subdomain: str, path: str, access_token: str):
+    # amo API base
+    base = f"https://{subdomain}.amocrm.ru"
+    r = requests.get(base + path, headers={"Authorization": f"Bearer {access_token}"}, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_valid_token(subdomain: str) -> str:
+    tokens = _tokens_get()
+    t = tokens.get(subdomain)
+    if not t:
         raise RuntimeError("not_connected: run /oauth/start and approve access")
-    if _is_token_expired(tok):
-        tok = _refresh_token(subdomain, tok)
-    return tok
 
-def amo_request(subdomain: str, method: str, path: str, params=None):
-    tok = _get_valid_token(subdomain)
-    base = _amo_base_url(subdomain)
-    url = base + path
-    headers = {"Authorization": f"Bearer {tok.get('access_token')}"}
-    resp = SESSION.request(method, url, headers=headers, params=params, timeout=40)
-    return resp
+    # If token still valid (with small buffer)
+    now = int(time.time())
+    expires_at = int(t.get("expires_at", 0))
+    if expires_at - 60 > now and t.get("access_token"):
+        return t["access_token"]
 
-# -----------------------------
-# Telegram
-# -----------------------------
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "telegram_not_configured"
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = SESSION.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
-    if resp.status_code >= 400:
-        return False, resp.text
-    return True, "ok"
+    # refresh
+    refreshed = _amo_refresh(t.get("refresh_token", ""))
+    new = {
+        "access_token": refreshed.get("access_token", ""),
+        "refresh_token": refreshed.get("refresh_token", ""),
+        "expires_at": now + int(refreshed.get("expires_in", 0)),
+        "token_type": refreshed.get("token_type", ""),
+        "scope": refreshed.get("scope", ""),
+        "updated_at": now,
+    }
+    tokens[subdomain] = new
+    _tokens_set(tokens)
+    log_event("oauth_refresh_ok", {"subdomain": subdomain})
+    return new["access_token"]
 
-# -----------------------------
+
+# ----------------------------
 # Routes
-# -----------------------------
+# ----------------------------
 @app.get("/")
 def index():
     return jsonify(
@@ -198,6 +248,7 @@ def index():
             "data_dir": DATA_DIR,
             "endpoints": [
                 "/health (GET)",
+                "/debug/env (GET)",
                 "/debug/last (GET)",
                 "/debug/tokens (GET)",
                 "/widget/ping (POST)",
@@ -205,41 +256,70 @@ def index():
                 "/oauth/start (GET)",
                 "/oauth/redirect (GET)",
                 "/oauth/callback (POST)",
-                "/oauth/status (GET)",
                 "/report/losses (GET)",
             ],
         }
     )
 
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
+
+@app.get("/debug/env")
+def debug_env():
+    # Show only presence (not secret values)
+    def present(v): return bool(v)
+
+    return jsonify(
+        {
+            "ok": True,
+            "data_dir": DATA_DIR,
+            "env_present": {
+                "AMO_CLIENT_ID": present(AMO_CLIENT_ID),
+                "AMO_CLIENT_SECRET": present(AMO_CLIENT_SECRET),
+                "AMO_REDIRECT_URI": present(AMO_REDIRECT_URI),
+                "TG_BOT_TOKEN": present(TG_BOT_TOKEN),
+                "TG_CHAT_ID": present(TG_CHAT_ID),
+            },
+        }
+    )
+
+
 @app.get("/debug/last")
 def debug_last():
-    limit = int(request.args.get("limit", "50"))
-    limit = max(1, min(500, limit))
-    return jsonify({"ok": True, "lines": _read_last_lines(EVENTS_FILE, limit=limit)})
+    try:
+        if not os.path.exists(EVENTS_FILE):
+            return jsonify({"ok": True, "lines": []})
+        with open(EVENTS_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            # read last ~16kb
+            f.seek(max(size - 16384, 0), os.SEEK_SET)
+            chunk = f.read().decode("utf-8", errors="ignore")
+        lines = [ln for ln in chunk.splitlines() if ln.strip()][-20:]
+        return jsonify({"ok": True, "lines": lines})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.get("/debug/tokens")
 def debug_tokens():
-    # show minimal info (don’t leak secrets)
-    t = _tokens()
-    out = {}
-    for sub, v in t.items():
-        out[sub] = {
-            "has_access_token": bool(v.get("access_token")),
-            "has_refresh_token": bool(v.get("refresh_token")),
-            "expires_at": v.get("expires_at"),
-            "updated_at": v.get("updated_at"),
-        }
-    return jsonify({"ok": True, "tokens": out})
+    # Do not expose tokens; show just which subdomains connected
+    try:
+        tokens = _tokens_get()
+        return jsonify({"ok": True, "connected": sorted(list(tokens.keys()))})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.post("/widget/ping")
 def widget_ping():
     data = request.get_json(silent=True) or {}
     log_event("ping", data)
     return jsonify({"ok": True})
+
 
 @app.post("/widget/install")
 def widget_install():
@@ -250,261 +330,215 @@ def widget_install():
         log_event("install_rejected_no_consent", data)
         return jsonify({"ok": False, "error": "consent_required"}), 400
 
-    required = ["account_id", "subdomain", "user_id", "fio", "email"]
+    required = ["account_id", "subdomain", "user_id", "fio", "email", "phone"]
     missing = [k for k in required if not data.get(k)]
     if missing:
         log_event("install_rejected_missing_fields", {"missing": missing, "data": data})
         return jsonify({"ok": False, "error": "missing_fields", "missing": missing}), 400
 
-    # Send lead to Telegram ONLY after user clicked Save (this endpoint is called from widget onSave)
-    msg = (
-        "🟦 Loss Control — новая установка\n"
-        f"Аккаунт: {data.get('subdomain')} (ID {data.get('account_id')})\n"
-        f"Пользователь: {data.get('fio')} (user_id {data.get('user_id')})\n"
+    # Send lead to Telegram
+    text = (
+        "🆕 Установка виджета Loss Control\n"
+        f"Аккаунт: {data.get('subdomain')}.amocrm.ru\n"
+        f"Account ID: {data.get('account_id')}\n"
+        f"User ID: {data.get('user_id')}\n"
+        f"ФИО: {data.get('fio')}\n"
         f"Email: {data.get('email')}\n"
-        f"Телефон: {data.get('phone') or '-'}\n"
-        f"Время: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        f"Телефон: {data.get('phone')}\n"
+        f"Backend URL: {data.get('backend_url','')}\n"
+        f"Дата: {datetime.utcnow().isoformat()}Z"
     )
-    ok, info = send_telegram(msg)
-    log_event("install", {"data": data, "telegram_ok": ok, "telegram_info": info})
-    return jsonify({"ok": True, "telegram_ok": ok})
+    tg_ok, tg_info = _tg_send(text)
 
-# -----------------------------
-# OAuth connect flow
-# -----------------------------
+    log_event("install", {"data": data, "telegram_ok": tg_ok, "telegram_info": tg_info})
+    return jsonify({"ok": True, "telegram_ok": tg_ok})
+
+
 @app.get("/oauth/start")
 def oauth_start():
     """
-    Returns amoCRM OAuth URL. We use mode=post_message, so amo sends code to redirect_uri and/or postMessage.
+    Returns amoCRM OAuth URL (mode=post_message).
+    If you add ?go=1 — will redirect browser to amoCRM instead of JSON.
     """
-    _require_oauth_env()
+    try:
+        missing = _require_oauth_env()
+        if missing:
+            return jsonify({"ok": False, "error": "missing_oauth_env", "missing": missing}), 400
 
-    # try read subdomain from query or referer
-    subdomain = (request.args.get("subdomain") or "").strip()
-    if not subdomain:
-        subdomain = _parse_subdomain_from_referer(request.headers.get("Referer", ""))
+        subdomain = (request.args.get("subdomain") or "").strip()
+        if not subdomain:
+            subdomain = _parse_subdomain_from_referer(request.headers.get("Referer", ""))
 
-    state = secrets.token_urlsafe(16)
-    states = _load_json(STATES_FILE, {})
-    states[state] = {"ts": int(time.time()), "subdomain": subdomain}
-    _save_json(STATES_FILE, states)
+        state = secrets.token_urlsafe(16)
 
-    params = {
-        "client_id": AMO_CLIENT_ID,
-        "state": state,
-        "mode": "post_message",
-    }
-    url = _amo_auth_host() + "/oauth?" + urlencode(params)
-    log_event("oauth_start", {"subdomain": subdomain, "state": state})
-    return jsonify({"ok": True, "url": url})
+        # save state (disk or memory)
+        states = _states_get()
+        states[state] = {"ts": int(time.time()), "subdomain": subdomain}
+        _states_set(states)
+
+        params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "post_message"}
+        url = _amo_auth_host() + "/oauth?" + urlencode(params)
+
+        log_event("oauth_start", {"subdomain": subdomain, "state": state})
+
+        if request.args.get("go") == "1":
+            return Response("", status=302, headers={"Location": url})
+        return jsonify({"ok": True, "url": url})
+    except Exception as e:
+        log_event("oauth_start_error", {"error": str(e)})
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
+
 
 @app.get("/oauth/redirect")
 def oauth_redirect():
     """
-    redirect_uri endpoint. amo can call it with code & state.
-    We'll exchange code to tokens and show simple HTML.
+    Redirect page for amoCRM 'mode=post_message'.
+    amo opens this URL with ?code=...&state=...
+    We'll POST that code to /oauth/callback and show a friendly message.
     """
-    try:
-        _require_oauth_env()
-        code = request.args.get("code", "")
-        state = request.args.get("state", "")
-        referer = request.headers.get("Referer", "")
+    # IMPORTANT: keep this HTML simple (amo opens it in a popup)
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Loss Control OAuth</title>
+  <style>body{{font-family:Arial, sans-serif; padding:24px;}}</style>
+</head>
+<body>
+  <h3>Подключаем аккаунт…</h3>
+  <div id="status">Пожалуйста, подождите.</div>
+  <script>
+    (function() {{
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      const state = params.get('state');
 
-        states = _load_json(STATES_FILE, {})
-        meta = states.get(state) or {}
-        subdomain = meta.get("subdomain") or _parse_subdomain_from_referer(referer)
+      // Try to inform opener (amo expects this)
+      try {{
+        if (window.opener && window.opener !== window) {{
+          window.opener.postMessage({{type:'amo_oauth', code, state}}, '*');
+        }}
+      }} catch(e) {{}}
 
-        if not code:
-            log_event("oauth_redirect_no_code", {"state": state, "referer": referer})
-            return Response("No code", status=400)
+      async function post() {{
+        const res = await fetch('/oauth/callback', {{
+          method: 'POST',
+          headers: {{'Content-Type':'application/json'}},
+          body: JSON.stringify({{
+            code: code,
+            state: state,
+            referer: document.referrer || '',
+            origin: window.location.origin
+          }})
+        }});
+        const data = await res.json().catch(() => ({{ok:false, error:'bad_json'}}));
+        const el = document.getElementById('status');
+        if (data && data.ok) {{
+          el.innerHTML = '✅ Аккаунт подключен. Можно закрыть окно.';
+        }} else {{
+          el.innerHTML = '❌ Ошибка подключения: ' + (data.details || data.error || 'unknown');
+        }}
+      }}
 
-        if not subdomain:
-            # If we can't detect it - user can pass ?subdomain=...
-            subdomain = (request.args.get("subdomain") or "").strip()
+      if (!code) {{
+        document.getElementById('status').innerHTML = '❌ Нет параметра code в URL';
+        return;
+      }}
+      post();
+    }})();
+  </script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
 
-        token_url = _amo_base_url(subdomain) + "/oauth2/access_token"
-        resp = SESSION.post(
-            token_url,
-            json={
-                "client_id": AMO_CLIENT_ID,
-                "client_secret": AMO_CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": AMO_REDIRECT_URL,
-            },
-            timeout=30,
-        )
-        if resp.status_code >= 400:
-            log_event("oauth_exchange_failed", {"subdomain": subdomain, "status": resp.status_code, "body": resp.text})
-            return Response("OAuth exchange failed", status=400)
-
-        data = resp.json()
-        expires_at = int(time.time()) + int(data.get("expires_in", 0))
-        tok = {
-            "access_token": data.get("access_token"),
-            "refresh_token": data.get("refresh_token"),
-            "expires_at": expires_at,
-            "token_type": data.get("token_type", "Bearer"),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _set_token(subdomain, tok)
-        log_event("oauth_ok", {"subdomain": subdomain, "referer": referer})
-
-        html = """
-<!doctype html>
-<html><head><meta charset="utf-8"><title>Loss Control</title></head>
-<body style="font-family: Arial, sans-serif; padding: 24px">
-  <h2>✅ Аккаунт подключен</h2>
-  <p>Можете закрыть это окно и вернуться в amoCRM.</p>
-</body></html>
-"""
-        return Response(html, mimetype="text/html")
-    except Exception as e:
-        log_event("oauth_redirect_error", {"error": str(e)})
-        return Response("Internal error", status=500)
 
 @app.post("/oauth/callback")
 def oauth_callback():
     """
-    Optional endpoint if you decide to forward code via JS postMessage from widget.
-    For now not required (we use /oauth/redirect flow).
+    Receives {code, state, referer} from /oauth/redirect and exchanges code -> tokens.
     """
-    data = request.get_json(silent=True) or {}
-    log_event("oauth_callback", data)
-    return jsonify({"ok": True})
-
-@app.get("/oauth/status")
-def oauth_status():
-    subdomain = (request.args.get("subdomain") or "").strip()
-    if not subdomain:
-        subdomain = _parse_subdomain_from_referer(request.headers.get("Referer", ""))
-    tok = _get_token(subdomain) if subdomain else None
-    return jsonify({"ok": True, "subdomain": subdomain, "connected": bool(tok)})
-
-# -----------------------------
-# Reports
-# -----------------------------
-def _date_to_unix_range(date_from: str, date_to: str):
-    # date_from / date_to as YYYY-MM-DD in local meaning; convert to UTC range
     try:
-        df = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        dt = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1) - timedelta(seconds=1)
-        return int(df.timestamp()), int(dt.timestamp())
-    except Exception:
-        raise ValueError("bad_date_format: use YYYY-MM-DD")
+        data = request.get_json(silent=True) or {}
+        code = (data.get("code") or "").strip()
+        state = (data.get("state") or "").strip()
+        referer = (data.get("referer") or "").strip()
 
-def _get_loss_reasons(subdomain: str):
-    # returns dict[id] = name
-    resp = amo_request(subdomain, "GET", "/api/v4/leads/loss_reasons")
-    if resp.status_code >= 400:
-        raise RuntimeError(f"loss_reasons_failed: {resp.status_code} {resp.text}")
-    data = resp.json()
-    items = data.get("_embedded", {}).get("loss_reasons", []) or []
-    return {int(it["id"]): it.get("name", "") for it in items if "id" in it}
+        if not code:
+            return jsonify({"ok": False, "error": "missing_code"}), 400
 
-def _get_pipelines(subdomain: str):
-    resp = amo_request(subdomain, "GET", "/api/v4/leads/pipelines")
-    if resp.status_code >= 400:
-        raise RuntimeError(f"pipelines_failed: {resp.status_code} {resp.text}")
-    data = resp.json()
-    return data.get("_embedded", {}).get("pipelines", []) or []
+        missing = _require_oauth_env()
+        if missing:
+            return jsonify({"ok": False, "error": "missing_oauth_env", "missing": missing}), 400
 
-def _fetch_lost_leads(subdomain: str, closed_from: int, closed_to: int):
-    """
-    Fetch lost leads in all pipelines for given closed_at range.
-    We first ask pipelines to collect 'lost' statuses, then request leads with filter[statuses] array.
-    """
-    pipelines = _get_pipelines(subdomain)
-    lost_statuses = []
-    for p in pipelines:
-        for st in (p.get("_embedded", {}).get("statuses", []) or []):
-            if st.get("type") == "lost":
-                lost_statuses.append({"pipeline_id": p.get("id"), "status_id": st.get("id")})
+        subdomain = _parse_subdomain_from_referer(referer)
+        # If state present, prefer stored subdomain from state
+        if state:
+            states = _states_get()
+            s = states.get(state)
+            if s and s.get("subdomain"):
+                subdomain = s["subdomain"]
 
-    if not lost_statuses:
-        return []
+        if not subdomain:
+            # last attempt: user can pass it explicitly
+            subdomain = (data.get("subdomain") or "").strip()
 
-    # Build filter params for multiple statuses (amo supports filter[statuses][i][pipeline_id]/[status_id])
-    params = {
-        "limit": 250,
-        "filter[closed_at][from]": closed_from,
-        "filter[closed_at][to]": closed_to,
-    }
-    for i, s in enumerate(lost_statuses[:50]):  # sane cap
-        params[f"filter[statuses][{i}][pipeline_id]"] = s["pipeline_id"]
-        params[f"filter[statuses][{i}][status_id]"] = s["status_id"]
+        if not subdomain:
+            return jsonify({"ok": False, "error": "cannot_detect_subdomain", "details": "No subdomain in referer/state"}), 400
 
-    leads = []
-    page = 1
-    while True:
-        params["page"] = page
-        resp = amo_request(subdomain, "GET", "/api/v4/leads", params=params)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"leads_failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        batch = data.get("_embedded", {}).get("leads", []) or []
-        leads.extend(batch)
+        tok = _amo_token_exchange(code)
+        now = int(time.time())
+        tokens = _tokens_get()
+        tokens[subdomain] = {
+            "access_token": tok.get("access_token", ""),
+            "refresh_token": tok.get("refresh_token", ""),
+            "expires_at": now + int(tok.get("expires_in", 0)),
+            "token_type": tok.get("token_type", ""),
+            "scope": tok.get("scope", ""),
+            "created_at": now,
+        }
+        _tokens_set(tokens)
 
-        # pagination: amo returns _links.next
-        next_link = (data.get("_links") or {}).get("next")
-        if not next_link or not batch:
-            break
-        page += 1
-        if page > 50:
-            break
-    return leads
+        log_event("oauth_ok", {"subdomain": subdomain, "referer": referer})
+
+        return jsonify({"ok": True, "subdomain": subdomain})
+    except requests.HTTPError as e:
+        # show amo error body if possible
+        details = ""
+        try:
+            details = e.response.text
+        except Exception:
+            details = str(e)
+        log_event("oauth_http_error", {"details": details})
+        return jsonify({"ok": False, "error": "amo_http_error", "details": details}), 400
+    except Exception as e:
+        log_event("oauth_error", {"error": str(e)})
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
+
 
 @app.get("/report/losses")
 def report_losses():
+    """
+    Very MVP endpoint:
+    returns basic counts for closed leads in date range.
+    Later we will expand into full analytics (reasons, idle days, lost money).
+    """
     try:
         subdomain = (request.args.get("subdomain") or "").strip()
         date_from = (request.args.get("date_from") or "").strip()
         date_to = (request.args.get("date_to") or "").strip()
-        manager_id = (request.args.get("manager_id") or "").strip()
-
         if not subdomain or not date_from or not date_to:
-            return jsonify({"ok": False, "error": "required: subdomain,date_from,date_to"}), 400
+            return jsonify({"ok": False, "error": "missing_params", "need": ["subdomain", "date_from", "date_to"]}), 400
 
-        closed_from, closed_to = _date_to_unix_range(date_from, date_to)
-        reasons = _get_loss_reasons(subdomain)
-        leads = _fetch_lost_leads(subdomain, closed_from, closed_to)
+        # Token
+        access = _get_valid_token(subdomain)
 
-        if manager_id:
-            try:
-                mid = int(manager_id)
-                leads = [l for l in leads if int(l.get("responsible_user_id") or 0) == mid]
-            except Exception:
-                return jsonify({"ok": False, "error": "manager_id must be int"}), 400
-
-        total = 0
-        by_reason = {}
-        for l in leads:
-            price = int(l.get("price") or 0)
-            total += price
-            rid = l.get("loss_reason_id")
-            rname = reasons.get(int(rid), "Без причины") if rid else "Без причины"
-            by_reason[rname] = by_reason.get(rname, 0) + price
-
-        top = sorted(by_reason.items(), key=lambda x: x[1], reverse=True)
-        return jsonify(
-            {
-                "ok": True,
-                "subdomain": subdomain,
-                "date_from": date_from,
-                "date_to": date_to,
-                "manager_id": manager_id or None,
-                "lost_count": len(leads),
-                "lost_amount": total,
-                "by_reason": [{"reason": k, "amount": v} for k, v in top],
-            }
-        )
+        # For now, just check we can call account endpoint
+        acc = _amo_api_get(subdomain, "/api/v4/account", access)
+        return jsonify({"ok": True, "subdomain": subdomain, "account_name": acc.get("name", "")})
     except Exception as e:
-        log_event("report_losses_error", {"error": str(e)})
         return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
-# -----------------------------
-# Run
-# -----------------------------
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("DEBUG", "0") == "1"
