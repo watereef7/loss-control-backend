@@ -1,15 +1,88 @@
-from urllib.parse import urlparse
+import os
+import json
+import time
 import secrets
+from datetime import datetime
+from urllib.parse import urlparse
 
-AMO_CLIENT_ID = os.environ.get("AMO_CLIENT_ID", "").strip()
-AMO_CLIENT_SECRET = os.environ.get("AMO_CLIENT_SECRET", "").strip()
-AMO_REDIRECT_URI = os.environ.get("AMO_REDIRECT_URI", "").strip()
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
 TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
+
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def utc_ts():
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def log_event(event_type: str, payload: dict):
+    record = {"ts": utc_ts(), "event": event_type, "payload": payload}
+    try:
+        ensure_data_dir()
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def env_first(*names, default=""):
+    """Берет первое непустое значение из env по списку ключей."""
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+# --- Telegram env (как у тебя уже настроено) ---
+TG_BOT_TOKEN = env_first("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = env_first("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(text: str) -> bool:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log_event("telegram_skipped_no_env", {"has_token": bool(TG_BOT_TOKEN), "has_chat": bool(TG_CHAT_ID)})
+        return False
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        ok = r.status_code == 200
+        if not ok:
+            log_event("telegram_failed", {"status": r.status_code, "text": r.text[:300]})
+        return ok
+    except Exception as e:
+        log_event("telegram_exception", {"error": str(e)})
+        return False
+
+
+# --- OAuth env ---
+# Поддерживаем И "AMO_CLIENT_ID", И твой вариант "AmoClientID", чтобы не переименовывать
+AMO_CLIENT_ID = env_first("AMO_CLIENT_ID", "AmoClientID")
+AMO_CLIENT_SECRET = env_first("AMO_CLIENT_SECRET", "AmoClientSecret")
+AMO_REDIRECT_URI = env_first("AMO_REDIRECT_URI", "AmoRedirectURL", "AmoRedirectURI")
+
 
 def load_tokens():
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        ensure_data_dir()
         if not os.path.exists(TOKENS_FILE):
             return {}
         with open(TOKENS_FILE, "r", encoding="utf-8") as f:
@@ -17,41 +90,114 @@ def load_tokens():
     except Exception:
         return {}
 
+
 def save_tokens(tokens: dict):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        ensure_data_dir()
         with open(TOKENS_FILE, "w", encoding="utf-8") as f:
             json.dump(tokens, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
+
 def parse_subdomain_from_referer(referer: str) -> str:
-    # referer приходит как адрес аккаунта пользователя (например https://meawake.amocrm.ru)
-    # см. документацию: code, referer, state ... приходят на Redirect URI
     if not referer:
         return ""
     host = urlparse(referer).netloc or referer
-    # host может быть "meawake.amocrm.ru"
-    return host.split(".")[0] if host else ""
+    # пример host: meawake.amocrm.ru
+    return host.split(".(".")[0] if host else ""
 
+
+@app.get("/")
+def index():
+    return jsonify({
+        "ok": True,
+        "service": "loss-control-backend",
+        "endpoints": [
+            "/health (GET)",
+            "/widget/install (POST)",
+            "/oauth/start (GET)",
+            "/oauth/callback (GET)",
+            "/debug/last (GET)"
+        ]
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.get("/debug/last")
+def debug_last():
+    """Последние 50 строк логов (для отладки)."""
+    try:
+        ensure_data_dir()
+        if not os.path.exists(LOG_FILE):
+            return jsonify({"ok": True, "lines": []})
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-50:]
+        return jsonify({"ok": True, "lines": [l.strip() for l in lines]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------
+# Widget lead endpoint
+# ---------------------------
+@app.post("/widget/install")
+def widget_install():
+    data = request.get_json(silent=True) or {}
+    log_event("widget_install_raw", data)
+
+    # "по-белому": шлем лид только при сохранении настроек (когда есть заполненные контакты)
+    required = ["fio", "email", "phone"]
+    missing = [k for k in required if not str(data.get(k, "")).strip()]
+    if missing:
+        log_event("widget_install_rejected_missing_fields", {"missing": missing, "data": data})
+        return jsonify({"ok": False, "error": "missing_fields", "missing": missing}), 400
+
+    account_id = data.get("account_id")
+    subdomain = (data.get("subdomain") or "").strip()
+    user_id = data.get("user_id")
+
+    fio = (data.get("fio") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+
+    text = "\n".join([
+        "✅ <b>Loss Control — новый лид (сохранены настройки)</b>",
+        f"Аккаунт: <b>{subdomain or '-'}</b>",
+        f"account_id: <code>{account_id}</code>",
+        f"user_id: <code>{user_id}</code>",
+        "",
+        f"ФИО: <b>{fio}</b>",
+        f"Email: <b>{email}</b>",
+        f"Телефон: <b>{phone}</b>",
+    ])
+
+    sent = send_telegram(text)
+    log_event("widget_install_sent", {"sent": sent, "subdomain": subdomain, "account_id": account_id})
+    return jsonify({"ok": True, "sent": sent})
+
+
+# ---------------------------
+# OAuth endpoints
+# ---------------------------
 @app.get("/oauth/start")
 def oauth_start():
     if not AMO_CLIENT_ID or not AMO_REDIRECT_URI:
         return jsonify({"ok": False, "error": "missing_env_AMO_CLIENT_ID_or_AMO_REDIRECT_URI"}), 500
 
-    # state нужен для защиты, можно хранить/проверять строже, но для MVP хватит так
     state = secrets.token_urlsafe(16)
-
-    # Открываем окно предоставления доступов
     url = f"https://www.amocrm.ru/oauth?client_id={AMO_CLIENT_ID}&state={state}&mode=post_message"
     return jsonify({"ok": True, "url": url})
 
+
 @app.get("/oauth/callback")
 def oauth_callback():
-    # На Redirect URI amoCRM приходит с GET-параметрами: code, referer, state, ...
-    # https://www.amocrm.ru/developers/content/oauth/step-by-step
     code = request.args.get("code")
-    referer = request.args.get("referer")  # адрес аккаунта пользователя
+    referer = request.args.get("referer")
     state = request.args.get("state")
     error = request.args.get("error")
 
@@ -70,9 +216,7 @@ def oauth_callback():
     if not AMO_CLIENT_ID or not AMO_CLIENT_SECRET or not AMO_REDIRECT_URI:
         return "<h3>На сервере не заданы AMO_* переменные</h3>", 500
 
-    # Обмен кода на токены через /oauth2/access_token (на домене аккаунта)
     token_url = f"https://{subdomain}.amocrm.ru/oauth2/access_token"
-
     payload = {
         "client_id": AMO_CLIENT_ID,
         "client_secret": AMO_CLIENT_SECRET,
@@ -106,7 +250,6 @@ def oauth_callback():
 
     log_event("oauth_ok", {"subdomain": subdomain, "referer": referer})
 
-    # Страница-заглушка (можно закрывать окно)
     return """
 <!doctype html>
 <html lang="ru">
@@ -117,3 +260,9 @@ def oauth_callback():
 </body>
 </html>
 """
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
