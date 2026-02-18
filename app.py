@@ -26,8 +26,14 @@ AMO_AUTH_URL = "https://www.amocrm.ru/oauth"
 # Storage (Render-friendly)
 # =========================
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.environ.get("DATA_DIR", "/var/data/loss_control")
-if not os.path.isabs(DATA_DIR):
+
+# ВАЖНО:
+# 1) Если DATA_DIR задан в Environment — используем его.
+# 2) Иначе по умолчанию пишем в ./data (это точно writable на Render).
+DATA_DIR = (os.environ.get("DATA_DIR") or "").strip()
+if not DATA_DIR:
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+elif not os.path.isabs(DATA_DIR):
     DATA_DIR = os.path.join(BASE_DIR, DATA_DIR)
 
 EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
@@ -49,10 +55,7 @@ def _now_iso() -> str:
 
 
 def _ensure_data_dir():
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def _load_json(path: str, default):
@@ -66,22 +69,20 @@ def _load_json(path: str, default):
 def _save_json(path: str, data):
     _ensure_data_dir()
     tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        return False
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return True
 
 
 def log_event(event_type: str, payload: dict):
     record = {"ts": _now_iso(), "event": event_type, "payload": payload}
-    _ensure_data_dir()
     try:
+        _ensure_data_dir()
         with open(EVENTS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
+        # если вообще ничего не пишется — не валим сервис
         pass
 
 
@@ -113,14 +114,12 @@ def _parse_subdomain_from_host(host: str) -> str:
     if not host:
         return ""
     host = host.strip()
-    # host can be like: meawake.amocrm.ru
     host = host.split(":")[0]
     parts = host.split(".")
+    # meawake.amocrm.ru -> meawake
     if len(parts) >= 3 and parts[-2] == "amocrm":
         return parts[0]
-    if len(parts) >= 2 and parts[-2].endswith("amocrm"):
-        return parts[0]
-    # sometimes referer contains just subdomain
+    # fallback
     if "." not in host:
         return host
     return parts[0]
@@ -131,11 +130,12 @@ def _infer_subdomain_from_request() -> str:
     sd = (request.args.get("subdomain") or "").strip()
     if sd:
         return sd
+
     # 2) referer query param from amo
     ref = (request.args.get("referer") or "").strip()
     if ref:
-        # ref can be like meawake.amocrm.ru
         return _parse_subdomain_from_host(ref)
+
     # 3) HTTP Referer header
     hdr = request.headers.get("Referer")
     if hdr:
@@ -143,15 +143,14 @@ def _infer_subdomain_from_request() -> str:
             return _parse_subdomain_from_host(urlparse(hdr).hostname or "")
         except Exception:
             pass
+
     return ""
 
 
 def _amo_base_url(subdomain: str) -> str:
-    """Return base URL like https://<subdomain>.amocrm.ru"""
     sd = (subdomain or "").strip()
     sd = sd.replace("https://", "").replace("http://", "")
     sd = sd.split("/")[0]
-    # if user passed full host like meawake.amocrm.ru -> take left part
     if "." in sd:
         sd = sd.split(".")[0]
     return f"https://{sd}.amocrm.ru"
@@ -186,12 +185,11 @@ def _amo_token_exchange(subdomain: str, code: str):
         "redirect_uri": AMO_REDIRECT_URI,
     }
 
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=25)
     if not r.ok:
         raise RuntimeError(f"token_exchange_failed: {r.status_code} {r.text[:300]}")
 
     data = r.json()
-    # normalize with expires_at
     expires_in = int(data.get("expires_in", 0) or 0)
     data["expires_at"] = int(time.time()) + max(expires_in - 60, 0)
     data["base_url"] = base
@@ -210,7 +208,7 @@ def _amo_refresh_token(subdomain: str, refresh_token: str):
         "redirect_uri": AMO_REDIRECT_URI,
     }
 
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=25)
     if not r.ok:
         raise RuntimeError(f"token_refresh_failed: {r.status_code} {r.text[:300]}")
 
@@ -226,7 +224,6 @@ def _amo_get_access_token(subdomain: str) -> str:
     if not tok:
         raise RuntimeError("not_connected: run /oauth/start and approve access")
 
-    # refresh if needed
     if int(tok.get("expires_at", 0)) <= int(time.time()):
         refreshed = _amo_refresh_token(subdomain, tok.get("refresh_token"))
         _tokens_set(subdomain, refreshed)
@@ -244,7 +241,7 @@ def _amo_api_get(subdomain: str, path: str, params=None):
 
     url = f"{base}{path}"
     headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    r = requests.get(url, headers=headers, params=params or {}, timeout=35)
     if not r.ok:
         raise RuntimeError(f"amo_api_failed: {r.status_code} {r.text[:300]}")
     return r.json()
@@ -262,7 +259,6 @@ def _tg_send(text: str):
 
 
 def _to_ts(date_yyyy_mm_dd: str, end_of_day: bool = False) -> int:
-    # returns unix seconds
     try:
         dt = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d")
         ts = int(time.mktime(dt.timetuple()))
@@ -276,7 +272,6 @@ def _to_ts(date_yyyy_mm_dd: str, end_of_day: bool = False) -> int:
 # =========================
 # Routes
 # =========================
-
 
 @app.get("/")
 def index():
@@ -308,7 +303,7 @@ def health():
 def debug_last():
     try:
         with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-20:]
+            lines = f.readlines()[-30:]
         return jsonify({"ok": True, "lines": [l.strip() for l in lines]})
     except Exception:
         return jsonify({"ok": True, "lines": []})
@@ -338,12 +333,6 @@ def widget_ping():
 
 @app.post("/widget/install")
 def widget_install():
-    """Called from widget settings 'Save'.
-
-    We REQUIRE consent=true and fio/email/phone.
-    Then send a lead to Telegram.
-    """
-
     data = request.get_json(silent=True) or {}
 
     consent = bool(data.get("consent"))
@@ -375,16 +364,8 @@ def widget_install():
 
 @app.get("/oauth/start")
 def oauth_start():
-    """Returns amo auth URL. If ?go=1 -> redirects to amo auth page.
-
-    Optionally accept ?subdomain=xxx to bind oauth state to that account.
-    """
-
     if not AMO_CLIENT_ID:
-        return (
-            jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}),
-            500,
-        )
+        return jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}), 500
 
     subdomain = _infer_subdomain_from_request()
 
@@ -392,7 +373,6 @@ def oauth_start():
     if subdomain:
         _states_put(state, subdomain)
 
-    # IMPORTANT: for amo RU "mode=post_message" is enough (redirect_uri is taken from integration settings)
     url = f"{AMO_AUTH_URL}?client_id={AMO_CLIENT_ID}&state={state}&mode=post_message"
 
     if request.args.get("go") == "1":
@@ -404,14 +384,10 @@ def oauth_start():
 @app.get("/oauth/callback")
 @app.post("/oauth/callback")
 def oauth_callback():
-    """amo redirects here after user approves access."""
-
     code = (request.args.get("code") or "").strip() or (request.form.get("code") or "").strip()
     state = (request.args.get("state") or "").strip() or (request.form.get("state") or "").strip()
 
-    # resolve subdomain
     subdomain = ""
-
     st = _states_get(state)
     if st and st.get("subdomain"):
         subdomain = st["subdomain"]
@@ -421,20 +397,14 @@ def oauth_callback():
 
     if not code:
         log_event("oauth_fail", {"reason": "no_code", "args": dict(request.args)})
-        return (
-            jsonify({"ok": False, "error": "no_code", "details": "No code provided"}),
-            400,
-        )
+        return jsonify({"ok": False, "error": "no_code"}), 400
 
     if not subdomain:
         log_event("oauth_fail", {"reason": "no_subdomain", "args": dict(request.args)})
-        return (
-            jsonify({"ok": False, "error": "no_subdomain", "details": "Cannot detect subdomain"}),
-            400,
-        )
+        return jsonify({"ok": False, "error": "no_subdomain"}), 400
 
     try:
-        tok = _amo_token_exchange(subdomain=subdomain, code=code)
+        tok = _amo_token_exchange(subdomain, code)
         _tokens_set(subdomain, tok)
         log_event("oauth_ok", {"subdomain": subdomain, "referer": request.args.get("referer")})
 
@@ -447,27 +417,12 @@ def oauth_callback():
         )
 
     except Exception as e:
-        log_event(
-            "oauth_error",
-            {
-                "subdomain": subdomain,
-                "error": str(e),
-                "args": dict(request.args),
-            },
-        )
-        return (
-            jsonify({"ok": False, "error": "internal_error", "details": str(e)}),
-            500,
-        )
+        log_event("oauth_error", {"subdomain": subdomain, "error": str(e), "args": dict(request.args)})
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 @app.get("/report/losses")
 def report_losses():
-    """Very first version of analytics.
-
-    Goal for now: prove that OAuth works and we can read leads.
-    """
-
     subdomain = (request.args.get("subdomain") or "").strip()
     date_from = (request.args.get("date_from") or "").strip()
     date_to = (request.args.get("date_to") or "").strip()
@@ -475,7 +430,6 @@ def report_losses():
     if not subdomain:
         return jsonify({"ok": False, "error": "missing_subdomain"}), 400
 
-    # simple range -> unix seconds
     ts_from = _to_ts(date_from) if date_from else 0
     ts_to = _to_ts(date_to, end_of_day=True) if date_to else 0
 
@@ -486,11 +440,9 @@ def report_losses():
         if ts_to:
             params["filter[closed_at][to]"] = ts_to
 
-        # NOTE: We do not yet filter only "lost" statuses here.
-        # First step: just return closed leads count & sum.
         resp = _amo_api_get(subdomain, "/api/v4/leads", params=params)
-
         leads = (resp.get("_embedded") or {}).get("leads") or []
+
         total = len(leads)
         total_price = 0
         for l in leads:
