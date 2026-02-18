@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import secrets
 from datetime import datetime
 from urllib.parse import urlparse
@@ -45,7 +44,7 @@ def env_first(*names, default=""):
     return default
 
 
-# --- Telegram env (как у тебя уже настроено) ---
+# --- Telegram env ---
 TG_BOT_TOKEN = env_first("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = env_first("TELEGRAM_CHAT_ID")
 
@@ -74,7 +73,7 @@ def send_telegram(text: str) -> bool:
 
 
 # --- OAuth env ---
-# Поддерживаем И "AMO_CLIENT_ID", И твой вариант "AmoClientID", чтобы не переименовывать
+# Поддерживаем и стандартные имена, и твои (если вдруг так заведены)
 AMO_CLIENT_ID = env_first("AMO_CLIENT_ID", "AmoClientID")
 AMO_CLIENT_SECRET = env_first("AMO_CLIENT_SECRET", "AmoClientSecret")
 AMO_REDIRECT_URI = env_first("AMO_REDIRECT_URI", "AmoRedirectURL", "AmoRedirectURI")
@@ -101,11 +100,17 @@ def save_tokens(tokens: dict):
 
 
 def parse_subdomain_from_referer(referer: str) -> str:
+    """
+    referer приходит как адрес аккаунта, например: https://meawake.amocrm.ru
+    Нужно получить subdomain: meawake
+    """
     if not referer:
         return ""
-    host = urlparse(referer).netloc or referer
-    # пример host: meawake.amocrm.ru
-    return host.split(".(".")[0] if host else ""
+    parsed = urlparse(referer)
+    host = parsed.netloc if parsed.netloc else referer  # если без схемы
+    # host пример: meawake.amocrm.ru
+    parts = host.split(".")
+    return parts[0] if parts else ""
 
 
 @app.get("/")
@@ -143,14 +148,13 @@ def debug_last():
 
 
 # ---------------------------
-# Widget lead endpoint
+# Widget lead endpoint (по-белому: только при нажатии "Сохранить")
 # ---------------------------
 @app.post("/widget/install")
 def widget_install():
     data = request.get_json(silent=True) or {}
     log_event("widget_install_raw", data)
 
-    # "по-белому": шлем лид только при сохранении настроек (когда есть заполненные контакты)
     required = ["fio", "email", "phone"]
     missing = [k for k in required if not str(data.get(k, "")).strip()]
     if missing:
@@ -166,7 +170,7 @@ def widget_install():
     phone = (data.get("phone") or "").strip()
 
     text = "\n".join([
-        "✅ <b>Loss Control — новый лид (сохранены настройки)</b>",
+        "✅ <b>Loss Control — новый лид (нажали Сохранить)</b>",
         f"Аккаунт: <b>{subdomain or '-'}</b>",
         f"account_id: <code>{account_id}</code>",
         f"user_id: <code>{user_id}</code>",
