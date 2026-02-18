@@ -1,125 +1,119 @@
-import os
-import json
-from datetime import datetime
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from urllib.parse import urlparse
+import secrets
 
-app = Flask(__name__)
+AMO_CLIENT_ID = os.environ.get("AMO_CLIENT_ID", "").strip()
+AMO_CLIENT_SECRET = os.environ.get("AMO_CLIENT_SECRET", "").strip()
+AMO_REDIRECT_URI = os.environ.get("AMO_REDIRECT_URI", "").strip()
 
-# ✅ CORS: можно оставить "*" на отладке, но для публикации лучше ограничить amoCRM
-# На старте оставим как у тебя (чтобы не словить блокировки), а потом ужесточим.
-CORS(app, resources={r"/*": {"origins": "*"}})
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
 
-BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, "data")
-LOG_FILE = os.path.join(DATA_DIR, "events.jsonl")
-
-# ✅ Берем из Render Environment (ты уже добавил)
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-
-
-def log_event(event_type: str, payload: dict):
-    record = {
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "event": event_type,
-        "payload": payload,
-    }
+def load_tokens():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if not os.path.exists(TOKENS_FILE):
+            return {}
+        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def save_tokens(tokens: dict):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
+def parse_subdomain_from_referer(referer: str) -> str:
+    # referer приходит как адрес аккаунта пользователя (например https://meawake.amocrm.ru)
+    # см. документацию: code, referer, state ... приходят на Redirect URI
+    if not referer:
+        return ""
+    host = urlparse(referer).netloc or referer
+    # host может быть "meawake.amocrm.ru"
+    return host.split(".")[0] if host else ""
 
-def send_telegram(text: str):
-    """Отправка сообщения в Telegram (в вашу группу)."""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("❗ Telegram env vars missing: TG_BOT_TOKEN / TG_CHAT_ID")
-        return False
+@app.get("/oauth/start")
+def oauth_start():
+    if not AMO_CLIENT_ID or not AMO_REDIRECT_URI:
+        return jsonify({"ok": False, "error": "missing_env_AMO_CLIENT_ID_or_AMO_REDIRECT_URI"}), 500
 
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    # state нужен для защиты, можно хранить/проверять строже, но для MVP хватит так
+    state = secrets.token_urlsafe(16)
+
+    # Открываем окно предоставления доступов
+    url = f"https://www.amocrm.ru/oauth?client_id={AMO_CLIENT_ID}&state={state}&mode=post_message"
+    return jsonify({"ok": True, "url": url})
+
+@app.get("/oauth/callback")
+def oauth_callback():
+    # На Redirect URI amoCRM приходит с GET-параметрами: code, referer, state, ...
+    # https://www.amocrm.ru/developers/content/oauth/step-by-step
+    code = request.args.get("code")
+    referer = request.args.get("referer")  # адрес аккаунта пользователя
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        log_event("oauth_denied", {"error": error, "state": state, "referer": referer})
+        return "<h3>Доступ не предоставлен</h3>", 400
+
+    if not code or not referer:
+        log_event("oauth_bad_callback", {"code": code, "referer": referer, "state": state})
+        return "<h3>Некорректный callback (нет code/referer)</h3>", 400
+
+    subdomain = parse_subdomain_from_referer(referer)
+    if not subdomain:
+        return "<h3>Не удалось определить subdomain</h3>", 400
+
+    if not AMO_CLIENT_ID or not AMO_CLIENT_SECRET or not AMO_REDIRECT_URI:
+        return "<h3>На сервере не заданы AMO_* переменные</h3>", 500
+
+    # Обмен кода на токены через /oauth2/access_token (на домене аккаунта)
+    token_url = f"https://{subdomain}.amocrm.ru/oauth2/access_token"
+
     payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "client_id": AMO_CLIENT_ID,
+        "client_secret": AMO_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": AMO_REDIRECT_URI,
     }
+
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        ok = (r.status_code == 200)
-        if not ok:
-            print("TG error:", r.status_code, r.text[:300])
-        return ok
+        r = requests.post(token_url, json=payload, timeout=15)
+        data = r.json() if r.content else {}
     except Exception as e:
-        print("TG send error:", str(e))
-        return False
+        log_event("oauth_token_exchange_exception", {"error": str(e), "subdomain": subdomain})
+        return "<h3>Ошибка обмена кода на токены</h3>", 500
 
+    if r.status_code != 200 or not data.get("access_token"):
+        log_event("oauth_token_exchange_failed", {"status": r.status_code, "resp": data, "subdomain": subdomain})
+        return "<h3>Не удалось получить токены</h3>", 400
 
-@app.get("/")
-def index():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "loss-control-backend",
-            "endpoints": [
-                "/ (GET)",
-                "/health (GET)",
-                "/widget/ping (POST)",
-                "/widget/install (POST)",
-            ],
-        }
-    )
+    tokens = load_tokens()
+    tokens[subdomain] = {
+        "updated_at": utc_ts(),
+        "referer": referer,
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "expires_in": data.get("expires_in"),
+        "token_type": data.get("token_type"),
+        "server_time": data.get("server_time"),
+    }
+    save_tokens(tokens)
 
+    log_event("oauth_ok", {"subdomain": subdomain, "referer": referer})
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-
-@app.post("/widget/ping")
-def widget_ping():
-    data = request.get_json(silent=True) or {}
-    log_event("ping", data)
-    return jsonify({"ok": True, "received": data})
-
-
-@app.post("/widget/install")
-def widget_install():
-    data = request.get_json(silent=True) or {}
-
-    consent = bool(data.get("consent"))
-    if not consent:
-        log_event("install_rejected_no_consent", data)
-        return jsonify({"ok": False, "error": "consent_required"}), 400
-
-    required = ["account_id", "subdomain", "user_id", "fio", "email", "phone"]
-    missing = [k for k in required if not data.get(k)]
-    if missing:
-        log_event("install_rejected_missing_fields", {"missing": missing, "data": data})
-        return jsonify({"ok": False, "error": "missing_fields", "missing": missing}), 400
-
-    log_event("install", data)
-
-    # ✅ Отправляем лид в Telegram
-    text = (
-        "🔥 <b>Новая установка Loss Control</b>\n"
-        f"👤 ФИО: <b>{data.get('fio') or '—'}</b>\n"
-        f"📧 Email: <b>{data.get('email') or '—'}</b>\n"
-        f"📞 Телефон: <b>{data.get('phone') or '—'}</b>\n"
-        f"🏢 Account ID: <b>{data.get('account_id') or '—'}</b>\n"
-        f"🌐 Subdomain: <b>{data.get('subdomain') or '—'}</b>\n"
-        f"🧑‍💻 User ID: <b>{data.get('user_id') or '—'}</b>\n"
-    )
-    tg_ok = send_telegram(text)
-    log_event("install_telegram_sent", {"ok": tg_ok})
-
-    return jsonify({"ok": True})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    debug = os.environ.get("DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    # Страница-заглушка (можно закрывать окно)
+    return """
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>OAuth OK</title></head>
+<body>
+  <h3>✅ Аккаунт подключён</h3>
+  <p>Можно закрыть это окно и вернуться в amoCRM.</p>
+</body>
+</html>
+"""
