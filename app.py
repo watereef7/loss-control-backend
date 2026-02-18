@@ -487,7 +487,7 @@ def oauth_callback():
             subdomain = (states[state].get("subdomain") or "").strip()
             # one-time use
             states.pop(state, None)
-            _states_put(states)
+            _states_set(states)
 
         # Fallback: try to infer from Referer (meawake.amocrm.ru)
         if not subdomain:
