@@ -193,6 +193,18 @@ def _settings_set(subdomain: str, settings: dict):
     _save_json(SETTINGS_FILE, all_settings)
 
 
+
+def _merge_settings(existing: dict, incoming: dict) -> dict:
+    """Merge settings, ignoring empty values from incoming."""
+    merged = dict(existing or {})
+    for k, v in (incoming or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        merged[k] = v
+    return merged
+
 def _amo_token_exchange(subdomain: str, code: str):
     if not (AMO_CLIENT_ID and AMO_CLIENT_SECRET and AMO_REDIRECT_URI):
         raise RuntimeError("missing_env: AMO_CLIENT_ID/SECRET/REDIRECT_URI")
@@ -487,7 +499,7 @@ def widget_install():
     prev = _settings_get(subdomain) or {}
     is_first = not bool(prev)
 
-    _settings_set(subdomain, payload_settings)
+    _settings_set(subdomain, _merge_settings(_settings_get(subdomain), payload_settings))
     log_event("install", {"subdomain": subdomain, "settings": payload_settings})
 
     # Telegram
@@ -535,7 +547,7 @@ def widget_settings():
         "updated_at": _now_iso(),
     }
 
-    _settings_set(subdomain, new_settings)
+    _settings_set(subdomain, _merge_settings(_settings_get(subdomain), new_settings))
     log_event("settings_save", {"subdomain": subdomain, "settings": new_settings})
 
     # send TG only if changed meaningful fields
