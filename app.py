@@ -561,7 +561,7 @@ def widget_settings():
             f"Телефон: {new_settings.get('phone')}\n"
             f"Backend URL: {new_settings.get('backend_url')}\n"
         )
-        _tg_send(text)
+        # (disabled) telegram notify here
 
     return _json_ok({"ok": True, "saved": True, "changed": changed})
 
@@ -614,7 +614,7 @@ def oauth_callback():
         log_event("oauth_ok", {"subdomain": subdomain})
 
         # optional TG
-        _tg_send(f"✅ Loss Control: аккаунт подключен\nsubdomain: {subdomain}")
+        # (disabled) telegram notify here
 
         return (
             "<html><body style='font-family:Arial'>"
