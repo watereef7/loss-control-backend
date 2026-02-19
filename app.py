@@ -247,7 +247,7 @@ def _amo_list_paged(subdomain: str, path: str, params=None, limit=DEFAULT_LIMIT,
         embedded = (data.get("_embedded") or {})
         # guess key by path
         key = None
-        for k in ("leads", "users", "pipelines", "loss_reasons"):
+        for k in ("leads", "users", "pipelines", "loss_reasons", "tasks", "events", "notes"):
             if k in embedded:
                 key = k
                 break
@@ -267,6 +267,58 @@ def _amo_list_paged(subdomain: str, path: str, params=None, limit=DEFAULT_LIMIT,
         page += 1
     return out
 
+
+
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def _lead_ids_with_current_tasks(subdomain: str, lead_ids: list, stale_days: int) -> set:
+    """Return lead IDs that have at least one OPEN task which is not overdue more than stale_days.
+    In other words, task.complete_till >= now - stale_days*86400.
+    """
+    now_ts = int(time.time())
+    min_ok = now_ts - int(stale_days) * 86400
+    ok = set()
+    if not lead_ids:
+        return ok
+
+    for chunk in _chunks(list(lead_ids), 200):
+        params = {
+            "filter[entity_type]": "leads",
+            "filter[is_completed]": 0,
+            "filter[entity_id][]": chunk,
+        }
+        tasks = _amo_list_paged(subdomain, "/api/v4/tasks", params=params, limit=250, max_pages=20)
+        for t in tasks:
+            eid = t.get("entity_id")
+            if not eid:
+                continue
+            ct = int(t.get("complete_till") or 0)
+            if ct >= min_ok:
+                ok.add(int(eid))
+    return ok
+
+
+def _lead_ids_with_recent_events(subdomain: str, lead_ids: list, from_ts: int) -> set:
+    """Return lead IDs that have at least one event with created_at >= from_ts."""
+    found = set()
+    if not lead_ids:
+        return found
+
+    for chunk in _chunks(list(lead_ids), 10):  # amo events API: up to 10 entity_id per request
+        params = {
+            "filter[created_at][from]": int(from_ts),
+            "filter[entity]": "lead",
+            "filter[entity_id][]": chunk,
+        }
+        events = _amo_list_paged(subdomain, "/api/v4/events", params=params, limit=250, max_pages=20)
+        for ev in events:
+            eid = ev.get("entity_id")
+            if eid:
+                found.add(int(eid))
+    return found
 
 def _tg_send(text: str):
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
@@ -505,7 +557,7 @@ def report_dashboard():
     """
     Returns:
     - lost deals (status_id=143) for date range, grouped by manager and reason
-    - stale deals: not closed, updated_at older than N days, grouped by manager
+    - stale deals: open deals with no recent events (>N days) AND no current tasks (or tasks overdue >N days), grouped by manager
     """
     subdomain = (request.args.get("subdomain") or "").strip()
     date_from = (request.args.get("date_from") or "").strip()
@@ -528,42 +580,59 @@ def report_dashboard():
         reasons = _amo_list_paged(subdomain, "/api/v4/leads/loss_reasons", params={}, limit=DEFAULT_LIMIT, max_pages=10)
         reason_name = {r.get("id"): r.get("name") for r in reasons if r.get("id")}
 
-        # -------- lost leads --------
-        params_lost = {}
+        # -------- closed leads (won/lost) --------
+        params_closed = {}
         if ts_from:
-            params_lost["filter[closed_at][from]"] = ts_from
+            params_closed["filter[closed_at][from]"] = ts_from
         if ts_to:
-            params_lost["filter[closed_at][to]"] = ts_to
+            params_closed["filter[closed_at][to]"] = ts_to
 
-        # pull closed leads and then filter to lost
-        closed = _amo_list_paged(subdomain, "/api/v4/leads", params=params_lost, limit=DEFAULT_LIMIT, max_pages=20)
+        # pull closed leads in range, then split to won/lost
+        closed = _amo_list_paged(subdomain, "/api/v4/leads", params=params_closed, limit=DEFAULT_LIMIT, max_pages=20)
 
         lost_leads = []
+        won_leads = []
         for l in closed:
-            # amo uses 143 for "closed and lost"
-            if int(l.get("status_id") or 0) != 143:
-                continue
+            sid = int(l.get("status_id") or 0)
             if manager_id and str(l.get("responsible_user_id")) != manager_id:
                 continue
-            lost_leads.append(l)
+            if sid == 143:
+                lost_leads.append(l)
+            elif sid == 142:
+                won_leads.append(l)
 
-        # -------- stale leads --------
-        params_stale = {
+        # -------- stale leads (v2) --------
+        # candidate set: deals not closed whose updated_at is older than N days (cheap prefilter)
+        params_candidates = {
             "filter[updated_at][to]": stale_ts_to,
         }
-        # get potentially stale by updated_at, then filter not closed
-        maybe_stale = _amo_list_paged(subdomain, "/api/v4/leads", params=params_stale, limit=DEFAULT_LIMIT, max_pages=20)
+        candidates = _amo_list_paged(subdomain, "/api/v4/leads", params=params_candidates, limit=DEFAULT_LIMIT, max_pages=20)
 
-        stale_leads = []
-        for l in maybe_stale:
+        open_candidates = []
+        for l in candidates:
             sid = int(l.get("status_id") or 0)
             if sid in (142, 143):  # closed win/loss
                 continue
             if manager_id and str(l.get("responsible_user_id")) != manager_id:
                 continue
-            stale_leads.append(l)
+            open_candidates.append(l)
+
+        lead_ids = [int(l.get("id") or 0) for l in open_candidates if l.get("id")]
+        lead_ids_set = set(lead_ids)
+
+        # Tasks rule from user:
+        # "нет задач" = нет текущих задач ИЛИ задачи просрочены на N дней
+        # We interpret "текущие" as open tasks with complete_till >= now - N days.
+        leads_with_current_tasks = _lead_ids_with_current_tasks(subdomain, lead_ids, stale_days)
+
+        # Events rule: no events in last N days
+        leads_with_recent_events = _lead_ids_with_recent_events(subdomain, list(lead_ids_set), stale_ts_to)
+
+        stale_ids = lead_ids_set - leads_with_current_tasks - leads_with_recent_events
+        stale_leads = [l for l in open_candidates if int(l.get("id") or 0) in stale_ids]
 
         # group by manager
+
         def pack_lead(l, kind: str):
             lid = l.get("id")
             return {
@@ -592,6 +661,9 @@ def report_dashboard():
                 {
                     "manager_id": uid,
                     "manager_name": user_name.get(uid) or str(uid),
+                    "won_count": 0,
+                    "won_sum": 0,
+                    "won_leads": [],
                     "lost_count": 0,
                     "lost_sum": 0,
                     "lost_by_reason": {},  # reason_name -> {count,sum}
@@ -610,7 +682,34 @@ def report_dashboard():
             rb["sum"] += price
             pm["lost_leads"].append(pack_lead(l, "lost"))
 
-        # stale aggregation
+        
+        # won aggregation
+        for l in won_leads:
+            uid = l.get("responsible_user_id")
+            key = str(uid)
+            pm = per_manager.setdefault(
+                key,
+                {
+                    "manager_id": uid,
+                    "manager_name": user_name.get(uid) or str(uid),
+                    "won_count": 0,
+                    "won_sum": 0,
+                    "won_leads": [],
+                    "lost_count": 0,
+                    "lost_sum": 0,
+                    "lost_by_reason": {},  # reason_name -> {count,sum}
+                    "lost_leads": [],
+                    "stale_count": 0,
+                    "stale_sum": 0,
+                    "stale_leads": [],
+                },
+            )
+            price = int(l.get("price") or 0)
+            pm["won_count"] += 1
+            pm["won_sum"] += price
+            pm["won_leads"].append(pack_lead(l, "won"))
+
+# stale aggregation
         for l in stale_leads:
             uid = l.get("responsible_user_id")
             key = str(uid)
@@ -619,6 +718,9 @@ def report_dashboard():
                 {
                     "manager_id": uid,
                     "manager_name": user_name.get(uid) or str(uid),
+                    "won_count": 0,
+                    "won_sum": 0,
+                    "won_leads": [],
                     "lost_count": 0,
                     "lost_sum": 0,
                     "lost_by_reason": {},
@@ -644,6 +746,7 @@ def report_dashboard():
             reasons_list.sort(key=lambda x: (-x["sum"], -x["count"], x["reason"]))
             pm["lost_by_reason"] = reasons_list
             # sort leads by price desc
+            pm.get("won_leads", []).sort(key=lambda x: (-x["price"], x["id"]))
             pm["lost_leads"].sort(key=lambda x: (-x["price"], x["id"]))
             pm["stale_leads"].sort(key=lambda x: (-x["price"], -x["days_no_activity"], x["id"]))
             managers_list.append(pm)
@@ -651,12 +754,15 @@ def report_dashboard():
         managers_list.sort(key=lambda x: (-(x["lost_sum"] + x["stale_sum"]), -(x["lost_count"] + x["stale_count"]), x["manager_name"]))
 
         totals = {
+            "won_count": sum(m.get("won_count", 0) for m in managers_list),
+            "won_sum": sum(m.get("won_sum", 0) for m in managers_list),
             "lost_count": sum(m["lost_count"] for m in managers_list),
             "lost_sum": sum(m["lost_sum"] for m in managers_list),
             "stale_count": sum(m["stale_count"] for m in managers_list),
             "stale_sum": sum(m["stale_sum"] for m in managers_list),
         }
         totals["total_risk_sum"] = totals["lost_sum"] + totals["stale_sum"]
+        totals["risk_open_stale_sum"] = totals["stale_sum"]
 
         return jsonify(
             {
@@ -668,7 +774,7 @@ def report_dashboard():
                 "manager_id": manager_id or None,
                 "totals": totals,
                 "managers": managers_list,
-                "note": "stale uses lead.updated_at as 'last activity' (v1).",
+                "note": "stale uses: no recent events (>N days) AND no current tasks (or tasks overdue >N days) (v2).",
             }
         )
 
