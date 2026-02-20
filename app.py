@@ -566,7 +566,7 @@ def oauth_start():
     if not AMO_CLIENT_ID:
         return jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}), 500
 
-    subdomain = _infer_subdomain_from_request()
+    subdomain = (request.args.get("subdomain") or "").strip() or _infer_subdomain_from_request()
     state = secrets.token_urlsafe(16)
     if subdomain:
         _states_put(state, subdomain)
