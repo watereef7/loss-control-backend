@@ -531,42 +531,52 @@ def widget_ping():
 
 @app.post("/widget/install")
 def widget_install():
+    # Receive installation/settings save event from widget UI and notify Telegram.
     data = request.get_json(silent=True) or {}
 
-    consent = bool(data.get("consent"))
-    if not consent:
-        log_event("install_rejected_no_consent", data)
-        return jsonify({"ok": False, "error": "consent_required"}), 400
+    subdomain = (data.get("subdomain") or "").strip() or (request.args.get("subdomain") or "").strip()
+    account_id = data.get("account_id") or data.get("account") or None
+    user_id = data.get("user_id") or data.get("user") or None
 
-    required = ["account_id", "subdomain", "user_id", "fio", "email", "phone"]
-    missing = [k for k in required if not data.get(k)]
-    if missing:
-        log_event("install_rejected_missing_fields", {"missing": missing, "data": data})
-        return jsonify({"ok": False, "error": "missing_fields", "missing": missing}), 400
+    fio = (data.get("fio") or data.get("contact_name") or data.get("contact") or "").strip()
+    email = (data.get("email") or data.get("contact_email") or "").strip()
+    phone = (data.get("phone") or data.get("contact_phone") or "").strip()
+    backend_url = (data.get("backend_url") or "").strip()
 
-    log_event("install", data)
+    log_event("widget_install_event", {
+        "subdomain": subdomain,
+        "account_id": account_id,
+        "user_id": user_id,
+        "fio": fio,
+        "email": email,
+        "phone": phone,
+        "backend_url": backend_url,
+    })
 
-    text = (
-        "🟦 Новый клиент установил Loss Control\n"
-        f"subdomain: {data.get('subdomain')}\n"
-        f"account_id: {data.get('account_id')}\n"
-        f"user_id: {data.get('user_id')}\n\n"
-        f"ФИО: {data.get('fio')}\n"
-        f"Email: {data.get('email')}\n"
-        f"Телефон: {data.get('phone')}\n"
-    )
-    _tg_send(text)
+    if TG_BOT_TOKEN and TG_CHAT_ID:
+        lines = [
+            "✅ Установлена/сохранены настройки интеграции «Контроль потерь»",
+            f"Аккаунт: {subdomain or '-'}",
+        ]
+        if account_id: lines.append(f"Account ID: {account_id}")
+        if user_id: lines.append(f"User ID: {user_id}")
+        if fio: lines.append(f"ФИО: {fio}")
+        if email: lines.append(f"Email: {email}")
+        if phone: lines.append(f"Телефон: {phone}")
+        if backend_url: lines.append(f"Backend: {backend_url}")
+
+        ok = _tg_send("\n".join(lines))
+        if not ok:
+            return jsonify({"ok": False, "error": "telegram_failed"}), 500
 
     return jsonify({"ok": True})
 
-
-# ---------- OAuth ----------
 @app.get("/oauth/start")
 def oauth_start():
     if not AMO_CLIENT_ID:
         return jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}), 500
 
-    subdomain = (request.args.get("subdomain") or "").strip() or _infer_subdomain_from_request()
+    subdomain = (request.args.get('subdomain') or '').strip() or _infer_subdomain_from_request()
     state = secrets.token_urlsafe(16)
     if subdomain:
         _states_put(state, subdomain)
