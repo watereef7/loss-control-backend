@@ -309,14 +309,24 @@ def _amo_list_paged(subdomain: str, path: str, params=None, limit=DEFAULT_LIMIT,
 
 def _tg_send(text: str):
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
-        return False
+        return {"ok": False, "error": "TG_BOT_TOKEN or TG_CHAT_ID is missing"}
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=15)
-        return r.ok
-    except Exception:
-        return False
+        try:
+            j = r.json()
+        except Exception:
+            j = {"raw": r.text}
+        return {"ok": bool(r.ok and j.get("ok", True)), "status": r.status_code, "response": j}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
+def send_telegram_message(text: str):
+    """Backwards-compatible helper used by install hooks."""
+    res = _tg_send(text)
+    if not res.get("ok"):
+        raise RuntimeError(str(res))
+    return res
 
 def _to_ts(date_yyyy_mm_dd: str, end_of_day: bool = False) -> int:
     try:
@@ -564,6 +574,13 @@ def debug_tg_test():
     text = (data.get("text") or "").strip() or "✅ TG test from Loss Control backend"
     ok = _tg_send(text)
     return jsonify({"ok": ok})
+@app.get("/debug/tg")
+def debug_tg():
+    """Send test message to Telegram and return full response."""
+    res = _tg_send("🧪 TG test from loss-control backend")
+    return jsonify(res)
+
+
 
 
 @app.post("/widget/ping")
@@ -617,7 +634,28 @@ def widget_install():
     return jsonify({"ok": True})
 
 
-@app.post("/oauth/callback")
+
+@app.get("/oauth/start")
+def oauth_start():
+    """Redirect user to amoCRM OAuth screen."""
+    subdomain = (request.args.get("subdomain") or "").strip()
+    if not subdomain:
+        return jsonify({"ok": False, "error": "subdomain is required"}), 400
+
+    # Build state with subdomain + nonce to prevent CSRF.
+    nonce = uuid.uuid4().hex
+    state = f"{subdomain}:{nonce}"
+
+    # Save state -> subdomain mapping in memory/file via log_event (simple persistence for debugging)
+    log_event("oauth_start", {"subdomain": subdomain, "state": state})
+
+    # amoCRM authorization URL (official docs)
+    # https://www.amocrm.ru/oauth?client_id=...&state=...&mode=popup
+    url = "https://www.amocrm.ru/oauth"
+    params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "popup"}
+    return redirect(url + "?" + urlencode(params))
+
+@app.route("/oauth/callback", methods=["GET","POST"])
 def oauth_callback():
     code = (request.args.get("code") or "").strip() or (request.form.get("code") or "").strip()
     state = (request.args.get("state") or "").strip() or (request.form.get("state") or "").strip()
