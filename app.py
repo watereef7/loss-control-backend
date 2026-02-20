@@ -2,11 +2,12 @@ import os
 import json
 import time
 import secrets
+import base64
 from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, make_response
 from flask_cors import CORS
 
 # =========================
@@ -529,54 +530,112 @@ def widget_ping():
     return jsonify({"ok": True, "received": data})
 
 
-@app.post("/widget/install")
+@app.route("/widget/install", methods=["POST", "OPTIONS"])
 def widget_install():
-    # Receive installation/settings save event from widget UI and notify Telegram.
+    """
+    Called when a customer saves integration settings in amoMarket.
+    We keep this endpoint максимально tolerant: no "consent" requirement,
+    accept both legacy and new field names.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     data = request.get_json(silent=True) or {}
 
-    subdomain = (data.get("subdomain") or "").strip() or (request.args.get("subdomain") or "").strip()
-    account_id = data.get("account_id") or data.get("account") or None
-    user_id = data.get("user_id") or data.get("user") or None
+    # tolerate different naming
+    subdomain = (data.get("subdomain") or "").strip()
+    account_id = data.get("account_id") or data.get("accountId") or None
 
-    fio = (data.get("fio") or data.get("contact_name") or data.get("contact") or "").strip()
+    fio = (data.get("fio") or data.get("contact_name") or data.get("name") or "").strip()
     email = (data.get("email") or data.get("contact_email") or "").strip()
     phone = (data.get("phone") or data.get("contact_phone") or "").strip()
     backend_url = (data.get("backend_url") or "").strip()
 
-    log_event("widget_install_event", {
+    payload = {
         "subdomain": subdomain,
         "account_id": account_id,
-        "user_id": user_id,
         "fio": fio,
         "email": email,
         "phone": phone,
         "backend_url": backend_url,
-    })
+        "ip": request.headers.get("X-Forwarded-For", request.remote_addr),
+        "ua": request.headers.get("User-Agent", ""),
+    }
+    log_event("install", payload)
 
-    if TG_BOT_TOKEN and TG_CHAT_ID:
-        lines = [
-            "✅ Установлена/сохранены настройки интеграции «Контроль потерь»",
-            f"Аккаунт: {subdomain or '-'}",
-        ]
-        if account_id: lines.append(f"Account ID: {account_id}")
-        if user_id: lines.append(f"User ID: {user_id}")
-        if fio: lines.append(f"ФИО: {fio}")
-        if email: lines.append(f"Email: {email}")
-        if phone: lines.append(f"Телефон: {phone}")
-        if backend_url: lines.append(f"Backend: {backend_url}")
+    text = (
+        "🟦 Установили «Контроль потерь»
+"
+        f"subdomain: {subdomain}
+"
+        f"account_id: {account_id}
+"
+        f"Backend: {backend_url}
 
-        ok = _tg_send("\n".join(lines))
-        if not ok:
-            return jsonify({"ok": False, "error": "telegram_failed"}), 500
+"
+        f"ФИО: {fio}
+"
+        f"Email: {email}
+"
+        f"Телефон: {phone}
+"
+    )
+    ok = _tg_send(text)
+    return jsonify({"ok": True, "tg_sent": ok})
 
-    return jsonify({"ok": True})
 
+# 1x1 transparent GIF for no-CORS install pings (Image() request)
+_TRANSPARENT_GIF = base64.b64decode("R0lGODlhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=")
+
+@app.get("/widget/install.gif")
+def widget_install_gif():
+    # Accept query args from Image() beacon
+    data = {
+        "subdomain": (request.args.get("subdomain") or "").strip(),
+        "contact_name": (request.args.get("contact_name") or "").strip(),
+        "contact_email": (request.args.get("contact_email") or "").strip(),
+        "contact_phone": (request.args.get("contact_phone") or "").strip(),
+        "ts": request.args.get("ts"),
+    }
+    # Reuse same notification logic
+    payload = {
+        "subdomain": data["subdomain"],
+        "fio": data["contact_name"],
+        "email": data["contact_email"],
+        "phone": data["contact_phone"],
+        "ip": request.headers.get("X-Forwarded-For", request.remote_addr),
+        "ua": request.headers.get("User-Agent", ""),
+    }
+    log_event("install_gif", payload)
+
+    text = (
+        "🟦 Установили «Контроль потерь»
+"
+        f"subdomain: {payload.get('subdomain')}
+
+"
+        f"ФИО: {payload.get('fio')}
+"
+        f"Email: {payload.get('email')}
+"
+        f"Телефон: {payload.get('phone')}
+"
+    )
+    _tg_send(text)
+
+    resp = make_response(_TRANSPARENT_GIF)
+    resp.headers["Content-Type"] = "image/gif"
+    return resp
+
+
+
+# ---------- OAuth ----------
 @app.get("/oauth/start")
 def oauth_start():
     if not AMO_CLIENT_ID:
         return jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}), 500
 
-    subdomain = (request.args.get('subdomain') or '').strip() or _infer_subdomain_from_request()
+    subdomain = (request.args.get("subdomain") or "").strip() or _infer_subdomain_from_request()
     state = secrets.token_urlsafe(16)
     if subdomain:
         _states_put(state, subdomain)
