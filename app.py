@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
+import uuid
+from urllib.parse import urlencode
 
 # =========================
 # Config from Environment
@@ -637,23 +639,30 @@ def widget_install():
 
 @app.get("/oauth/start")
 def oauth_start():
-    """Redirect user to amoCRM OAuth screen."""
-    subdomain = (request.args.get("subdomain") or "").strip()
-    if not subdomain:
-        return jsonify({"ok": False, "error": "subdomain is required"}), 400
+    """
+    Redirect user to amoCRM OAuth screen.
+    Opens amoCRM popup authorization page.
+    """
+    try:
+        subdomain = (request.args.get("subdomain") or "").strip()
+        if not subdomain:
+            return jsonify({"ok": False, "error": "subdomain is required"}), 400
 
-    # Build state with subdomain + nonce to prevent CSRF.
-    nonce = uuid.uuid4().hex
-    state = f"{subdomain}:{nonce}"
+        if not AMO_CLIENT_ID:
+            return jsonify({"ok": False, "error": "AMO_CLIENT_ID is missing on server"}), 500
 
-    # Save state -> subdomain mapping in memory/file via log_event (simple persistence for debugging)
-    log_event("oauth_start", {"subdomain": subdomain, "state": state})
+        nonce = uuid.uuid4().hex
+        state = f"{subdomain}:{nonce}"
 
-    # amoCRM authorization URL (official docs)
-    # https://www.amocrm.ru/oauth?client_id=...&state=...&mode=popup
-    url = "https://www.amocrm.ru/oauth"
-    params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "popup"}
-    return redirect(url + "?" + urlencode(params))
+        # log for debugging
+        log_event("oauth_start", {"subdomain": subdomain, "state": state})
+
+        url = "https://www.amocrm.ru/oauth"
+        params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "popup"}
+        return redirect(url + "?" + urlencode(params))
+    except Exception as e:
+        log_event("oauth_start_error", {"error": str(e)})
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/oauth/callback", methods=["GET","POST"])
 def oauth_callback():
