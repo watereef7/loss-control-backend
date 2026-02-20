@@ -641,12 +641,37 @@ def widget_install():
 def oauth_start():
     """
     Redirect user to amoCRM OAuth screen.
-    Opens amoCRM popup authorization page.
+    Returns tiny HTML that navigates to amoCRM OAuth (more reliable in popup windows).
     """
     try:
         subdomain = (request.args.get("subdomain") or "").strip()
         if not subdomain:
             return jsonify({"ok": False, "error": "subdomain is required"}), 400
+
+        if not AMO_CLIENT_ID:
+            return jsonify({"ok": False, "error": "AMO_CLIENT_ID is missing on server"}), 500
+
+        nonce = uuid.uuid4().hex
+        state = f"{subdomain}:{nonce}"
+        log_event("oauth_start", {"subdomain": subdomain, "state": state})
+
+        url = "https://www.amocrm.ru/oauth"
+        params = {"client_id": AMO_CLIENT_ID, "state": state, "mode": "popup"}
+        target = url + "?" + urlencode(params)
+
+        html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0;url={target}">
+<title>Redirecting…</title></head>
+<body style="font-family:Arial,sans-serif;padding:20px">
+Перенаправляю на amoCRM…<br>
+Если не открылось автоматически, нажмите: <a href="{target}">Продолжить</a>
+<script>window.location.replace({target!r});</script>
+</body></html>"""
+        from flask import Response
+        return Response(html, mimetype="text/html")
+    except Exception as e:
+        log_event("oauth_start_error", {"error": str(e)})
+        return jsonify({"ok": False, "error": str(e)}), 500
 
         if not AMO_CLIENT_ID:
             return jsonify({"ok": False, "error": "AMO_CLIENT_ID is missing on server"}), 500
