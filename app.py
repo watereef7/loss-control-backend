@@ -1,6 +1,3 @@
-# app.py — Loss Control backend for amoCRM
-# Finalized: settings save + Telegram notifications + OAuth + report API
-
 import os
 import json
 import time
@@ -9,7 +6,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, redirect, make_response
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 
 # =========================
@@ -26,11 +23,17 @@ TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
 # amo auth page for RU region
 AMO_AUTH_URL = "https://www.amocrm.ru/oauth"
 
+# Limits / safeguards (to avoid rate-limit explosions)
+DEFAULT_LIMIT = 100
+MAX_STALE_ACTIVITY_CHECK = int(os.environ.get("MAX_STALE_ACTIVITY_CHECK") or "200")  # max leads for deep check per request
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT") or "35")
+
 # =========================
 # Storage (Render-friendly)
 # =========================
 BASE_DIR = os.path.dirname(__file__)
 
+# Use ./data by default (writable). If DATA_DIR is set — use it.
 DATA_DIR = (os.environ.get("DATA_DIR") or "").strip()
 if not DATA_DIR:
     DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -38,18 +41,13 @@ elif not os.path.isabs(DATA_DIR):
     DATA_DIR = os.path.join(BASE_DIR, DATA_DIR)
 
 EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
-TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")       # by subdomain
-STATES_FILE = os.path.join(DATA_DIR, "states.json")       # oauth states mapping
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")   # widget settings by subdomain
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")   # by subdomain
+STATES_FILE = os.path.join(DATA_DIR, "states.json")   # oauth states mapping
 
 STATE_TTL_SEC = 15 * 60
-DEFAULT_LIMIT = 100
 
 app = Flask(__name__)
-
-# CORS: allow widget iframe and your report page to call backend
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
-
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # =========================
 # Helpers
@@ -113,24 +111,15 @@ def _states_put(state: str, subdomain: str):
 
 
 def _parse_subdomain_from_host(host: str) -> str:
-    """Supports amo.ru and kommo.com style hosts."""
     if not host:
         return ""
-    host = host.strip().split(":")[0].lower()
-
-    # meawake.amocrm.ru -> meawake
-    if host.endswith(".amocrm.ru"):
-        return host.split(".")[0]
-
-    # meawake.kommo.com -> meawake
-    if host.endswith(".kommo.com"):
-        return host.split(".")[0]
-
-    # if already just subdomain
+    host = host.strip().split(":")[0]
+    parts = host.split(".")
+    if len(parts) >= 3 and parts[-2] == "amocrm":
+        return parts[0]
     if "." not in host:
         return host
-
-    return host.split(".")[0]
+    return parts[0]
 
 
 def _infer_subdomain_from_request() -> str:
@@ -138,15 +127,11 @@ def _infer_subdomain_from_request() -> str:
     if sd:
         return sd
 
-    # sometimes widget passes referer URL explicitly
     ref = (request.args.get("referer") or "").strip()
     if ref:
-        try:
-            return _parse_subdomain_from_host(urlparse(ref).hostname or "")
-        except Exception:
-            return _parse_subdomain_from_host(ref)
+        return _parse_subdomain_from_host(ref)
 
-    hdr = request.headers.get("Referer") or request.headers.get("Origin")
+    hdr = request.headers.get("Referer")
     if hdr:
         try:
             return _parse_subdomain_from_host(urlparse(hdr).hostname or "")
@@ -161,7 +146,6 @@ def _amo_base_url(subdomain: str) -> str:
     sd = sd.split("/")[0]
     if "." in sd:
         sd = sd.split(".")[0]
-    # RU amo
     return f"https://{sd}.amocrm.ru"
 
 
@@ -179,32 +163,6 @@ def _tokens_set(subdomain: str, token_payload: dict):
     _save_json(TOKENS_FILE, all_tokens)
 
 
-def _settings_all():
-    return _load_json(SETTINGS_FILE, {})
-
-
-def _settings_get(subdomain: str):
-    return _settings_all().get(subdomain, {})
-
-
-def _settings_set(subdomain: str, settings: dict):
-    all_settings = _settings_all()
-    all_settings[subdomain] = settings
-    _save_json(SETTINGS_FILE, all_settings)
-
-
-
-def _merge_settings(existing: dict, incoming: dict) -> dict:
-    """Merge settings, ignoring empty values from incoming."""
-    merged = dict(existing or {})
-    for k, v in (incoming or {}).items():
-        if v is None:
-            continue
-        if isinstance(v, str) and v.strip() == "":
-            continue
-        merged[k] = v
-    return merged
-
 def _amo_token_exchange(subdomain: str, code: str):
     if not (AMO_CLIENT_ID and AMO_CLIENT_SECRET and AMO_REDIRECT_URI):
         raise RuntimeError("missing_env: AMO_CLIENT_ID/SECRET/REDIRECT_URI")
@@ -218,7 +176,7 @@ def _amo_token_exchange(subdomain: str, code: str):
         "code": code,
         "redirect_uri": AMO_REDIRECT_URI,
     }
-    r = requests.post(url, json=payload, timeout=25)
+    r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
     if not r.ok:
         raise RuntimeError(f"token_exchange_failed: {r.status_code} {r.text[:400]}")
 
@@ -239,7 +197,7 @@ def _amo_refresh_token(subdomain: str, refresh_token: str):
         "refresh_token": refresh_token,
         "redirect_uri": AMO_REDIRECT_URI,
     }
-    r = requests.post(url, json=payload, timeout=25)
+    r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
     if not r.ok:
         raise RuntimeError(f"token_refresh_failed: {r.status_code} {r.text[:400]}")
 
@@ -253,7 +211,7 @@ def _amo_refresh_token(subdomain: str, refresh_token: str):
 def _amo_get_access_token(subdomain: str) -> str:
     tok = _tokens_get(subdomain)
     if not tok:
-        raise RuntimeError("not_connected: run OAuth and approve access")
+        raise RuntimeError("not_connected: run /oauth/start and approve access")
 
     if int(tok.get("expires_at", 0)) <= int(time.time()):
         refreshed = _amo_refresh_token(subdomain, tok.get("refresh_token"))
@@ -271,7 +229,14 @@ def _amo_request(subdomain: str, method: str, path: str, params=None, json_body=
     token = _amo_get_access_token(subdomain)
     url = f"{base}{path}"
     headers = {"Authorization": f"Bearer {token}"}
-    r = requests.request(method, url, headers=headers, params=params or {}, json=json_body, timeout=35)
+    r = requests.request(
+        method,
+        url,
+        headers=headers,
+        params=params or {},
+        json=json_body,
+        timeout=HTTP_TIMEOUT,
+    )
     if not r.ok:
         raise RuntimeError(f"amo_api_failed: {r.status_code} {r.text[:500]}")
     if r.status_code == 204:
@@ -290,7 +255,7 @@ def _amo_list_paged(subdomain: str, path: str, params=None, limit=DEFAULT_LIMIT,
         data = _amo_request(subdomain, "GET", path, params=params)
         embedded = (data.get("_embedded") or {})
         key = None
-        for k in ("leads", "users", "pipelines", "loss_reasons", "tasks", "events", "notes"):
+        for k in ("leads", "users", "pipelines", "loss_reasons", "tasks", "notes"):
             if k in embedded:
                 key = k
                 break
@@ -307,56 +272,6 @@ def _amo_list_paged(subdomain: str, path: str, params=None, limit=DEFAULT_LIMIT,
             break
         page += 1
     return out
-
-
-def _chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-def _lead_ids_with_current_tasks(subdomain: str, lead_ids: list, stale_days: int) -> set:
-    """Lead IDs that have at least one OPEN task which is not overdue more than stale_days."""
-    now_ts = int(time.time())
-    min_ok = now_ts - int(stale_days) * 86400
-    ok = set()
-    if not lead_ids:
-        return ok
-
-    for chunk in _chunks(list(lead_ids), 200):
-        params = {
-            "filter[entity_type]": "leads",
-            "filter[is_completed]": 0,
-            "filter[entity_id][]": chunk,
-        }
-        tasks = _amo_list_paged(subdomain, "/api/v4/tasks", params=params, limit=250, max_pages=20)
-        for t in tasks:
-            eid = t.get("entity_id")
-            if not eid:
-                continue
-            ct = int(t.get("complete_till") or 0)
-            if ct >= min_ok:
-                ok.add(int(eid))
-    return ok
-
-
-def _lead_ids_with_recent_events(subdomain: str, lead_ids: list, from_ts: int) -> set:
-    """Lead IDs that have at least one event with created_at >= from_ts."""
-    found = set()
-    if not lead_ids:
-        return found
-
-    for chunk in _chunks(list(lead_ids), 10):  # events API: up to 10 entity_id per request
-        params = {
-            "filter[created_at][from]": int(from_ts),
-            "filter[entity]": "lead",
-            "filter[entity_id][]": chunk,
-        }
-        events = _amo_list_paged(subdomain, "/api/v4/events", params=params, limit=250, max_pages=20)
-        for ev in events:
-            eid = ev.get("entity_id")
-            if eid:
-                found.add(int(eid))
-    return found
 
 
 def _tg_send(text: str):
@@ -387,10 +302,80 @@ def _days_since(ts: int) -> int:
     return max(0, int((int(time.time()) - int(ts)) / 86400))
 
 
-def _json_ok(payload: dict, status: int = 200):
-    resp = make_response(jsonify(payload), status)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+def _env_mask(v: str) -> str:
+    if not v:
+        return ""
+    v = str(v)
+    if len(v) <= 6:
+        return "***"
+    return v[:3] + "***" + v[-2:]
+
+
+# -------- Activity helpers (stale logic v2) --------
+def _lead_has_open_tasks(subdomain: str, lead_id: int) -> bool:
+    """True if there is at least one unfinished task attached to the lead."""
+    try:
+        params = {
+            "filter[entity_type]": "leads",
+            "filter[entity_id]": int(lead_id),
+            "filter[is_completed]": 0,
+            "limit": 1,
+        }
+        data = _amo_request(subdomain, "GET", "/api/v4/tasks", params=params)
+        tasks = ((data.get("_embedded") or {}).get("tasks") or [])
+        return len(tasks) > 0
+    except Exception:
+        # if tasks api fails, we prefer NOT to mark lead stale
+        return True
+
+
+def _lead_last_task_ts(subdomain: str, lead_id: int) -> int:
+    """Returns timestamp (seconds) of the most recently updated task for the lead, or 0."""
+    try:
+        params = {
+            "filter[entity_type]": "leads",
+            "filter[entity_id]": int(lead_id),
+            "limit": 1,
+            "order[updated_at]": "desc",
+        }
+        data = _amo_request(subdomain, "GET", "/api/v4/tasks", params=params)
+        tasks = ((data.get("_embedded") or {}).get("tasks") or [])
+        if not tasks:
+            return 0
+        t = tasks[0] or {}
+        return int(t.get("updated_at") or t.get("created_at") or 0)
+    except Exception:
+        return 0
+
+
+def _lead_last_note_ts(subdomain: str, lead_id: int) -> int:
+    """Returns timestamp (seconds) of the most recent note in the lead, or 0."""
+    try:
+        params = {"limit": 1, "order[created_at]": "desc"}
+        data = _amo_request(subdomain, "GET", f"/api/v4/leads/{int(lead_id)}/notes", params=params)
+        notes = ((data.get("_embedded") or {}).get("notes") or [])
+        if not notes:
+            return 0
+        n = notes[0] or {}
+        return int(n.get("created_at") or 0)
+    except Exception:
+        return 0
+
+
+def _lead_last_activity_ts(subdomain: str, lead: dict) -> int:
+    """
+    We treat 'activity' as max of:
+    - last note created_at
+    - last task updated_at/created_at
+    - lead.updated_at (fallback)
+    """
+    lead_id = int(lead.get("id") or 0)
+    ts = int(lead.get("updated_at") or 0)
+
+    lt = _lead_last_task_ts(subdomain, lead_id)
+    ln = _lead_last_note_ts(subdomain, lead_id)
+
+    return max(ts, lt, ln)
 
 
 # =========================
@@ -398,7 +383,7 @@ def _json_ok(payload: dict, status: int = 200):
 # =========================
 @app.get("/")
 def index():
-    return _json_ok(
+    return jsonify(
         {
             "ok": True,
             "service": "loss-control-backend",
@@ -407,11 +392,10 @@ def index():
                 "/health (GET)",
                 "/debug/last (GET)",
                 "/debug/tokens (GET)",
-                "/debug/settings (GET)",
+                "/debug/env (GET)",
+                "/debug/tg_test (POST)",
                 "/widget/ping (POST)",
                 "/widget/install (POST)",
-                "/widget/settings (POST)",
-                "/widget/settings (GET)",
                 "/oauth/start (GET)",
                 "/oauth/callback (GET/POST)",
                 "/api/users (GET)",
@@ -425,17 +409,17 @@ def index():
 
 @app.get("/health")
 def health():
-    return _json_ok({"ok": True})
+    return jsonify({"ok": True})
 
 
 @app.get("/debug/last")
 def debug_last():
     try:
         with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-80:]
-        return _json_ok({"ok": True, "lines": [l.strip() for l in lines]})
+            lines = f.readlines()[-120:]
+        return jsonify({"ok": True, "lines": [l.strip() for l in lines]})
     except Exception:
-        return _json_ok({"ok": True, "lines": []})
+        return jsonify({"ok": True, "lines": []})
 
 
 @app.get("/debug/tokens")
@@ -450,140 +434,91 @@ def debug_tokens():
                 "expires_at": tok.get("expires_at"),
             }
         )
-    return _json_ok({"ok": True, "connected": connected})
+    return jsonify({"ok": True, "connected": connected})
 
 
-@app.get("/debug/settings")
-def debug_settings():
-    return _json_ok({"ok": True, "settings": _settings_all()})
+@app.get("/debug/env")
+def debug_env():
+    # Helpful for widget settings diagnostics (do NOT expose full secrets)
+    return jsonify(
+        {
+            "ok": True,
+            "has_amo_client_id": bool(AMO_CLIENT_ID),
+            "has_amo_client_secret": bool(AMO_CLIENT_SECRET),
+            "has_amo_redirect_uri": bool(AMO_REDIRECT_URI),
+            "has_tg_bot_token": bool(TG_BOT_TOKEN),
+            "has_tg_chat_id": bool(TG_CHAT_ID),
+            "amo_client_id_masked": _env_mask(AMO_CLIENT_ID),
+            "amo_redirect_uri": AMO_REDIRECT_URI,
+            "tg_chat_id": TG_CHAT_ID,
+            "max_stale_activity_check": MAX_STALE_ACTIVITY_CHECK,
+        }
+    )
 
 
-# ---------- Widget meta ----------
+@app.post("/debug/tg_test")
+def debug_tg_test():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip() or "✅ TG test from Loss Control backend"
+    ok = _tg_send(text)
+    return jsonify({"ok": ok})
+
+
 @app.post("/widget/ping")
 def widget_ping():
     data = request.get_json(silent=True) or {}
     log_event("ping", data)
-    return _json_ok({"ok": True, "received": data})
+    return jsonify({"ok": True, "received": data})
 
 
 @app.post("/widget/install")
 def widget_install():
-    """
-    Called from widget UI when client fills settings and clicks Save (install/first setup).
-    We also store settings per subdomain and send Telegram notification.
-    """
     data = request.get_json(silent=True) or {}
 
-    consent = bool(data.get("consent", True))  # keep backward compatible
+    consent = bool(data.get("consent"))
     if not consent:
         log_event("install_rejected_no_consent", data)
-        return _json_ok({"ok": False, "error": "consent_required"}, 400)
+        return jsonify({"ok": False, "error": "consent_required"}), 400
 
-    required = ["subdomain", "fio", "email", "phone"]
-    missing = [k for k in required if not (data.get(k) or "").strip()]
+    required = ["account_id", "subdomain", "user_id", "fio", "email", "phone"]
+    missing = [k for k in required if not data.get(k)]
     if missing:
         log_event("install_rejected_missing_fields", {"missing": missing, "data": data})
-        return _json_ok({"ok": False, "error": "missing_fields", "missing": missing}, 400)
+        return jsonify({"ok": False, "error": "missing_fields", "missing": missing}), 400
 
-    subdomain = (data.get("subdomain") or "").strip()
-    payload_settings = {
-        "backend_url": (data.get("backend_url") or data.get("backendUrl") or "").strip(),
-        "fio": (data.get("fio") or "").strip(),
-        "email": (data.get("email") or "").strip(),
-        "phone": (data.get("phone") or "").strip(),
-        "account_id": data.get("account_id") or data.get("accountId"),
-        "user_id": data.get("user_id") or data.get("userId"),
-        "updated_at": _now_iso(),
-    }
+    log_event("install", data)
 
-    prev = _settings_get(subdomain) or {}
-    is_first = not bool(prev)
-
-    _settings_set(subdomain, _merge_settings(_settings_get(subdomain), payload_settings))
-    log_event("install", {"subdomain": subdomain, "settings": payload_settings})
-
-    # Telegram
-    action = "🟦 УСТАНОВКА" if is_first else "🟨 ОБНОВЛЕНИЕ НАСТРОЕК"
     text = (
-        f"{action} Loss Control\n"
-        f"subdomain: {subdomain}\n"
-        f"account_id: {payload_settings.get('account_id')}\n"
-        f"user_id: {payload_settings.get('user_id')}\n\n"
-        f"ФИО: {payload_settings.get('fio')}\n"
-        f"Email: {payload_settings.get('email')}\n"
-        f"Телефон: {payload_settings.get('phone')}\n"
-        f"Backend URL: {payload_settings.get('backend_url')}\n"
+        "🟦 Новый клиент установил Loss Control\n"
+        f"subdomain: {data.get('subdomain')}\n"
+        f"account_id: {data.get('account_id')}\n"
+        f"user_id: {data.get('user_id')}\n\n"
+        f"ФИО: {data.get('fio')}\n"
+        f"Email: {data.get('email')}\n"
+        f"Телефон: {data.get('phone')}\n"
     )
     _tg_send(text)
 
-    return _json_ok({"ok": True, "saved": True, "first_time": is_first})
-
-
-@app.route("/widget/settings", methods=["GET", "POST"])
-def widget_settings():
-    """
-    GET  /widget/settings?subdomain=xxx  -> returns saved settings (for widget UI)
-    POST /widget/settings                -> saves settings (same as install, but without TG spam if unchanged)
-    """
-    if request.method == "GET":
-        subdomain = (request.args.get("subdomain") or "").strip()
-        if not subdomain:
-            return _json_ok({"ok": False, "error": "missing_subdomain"}, 400)
-        return _json_ok({"ok": True, "subdomain": subdomain, "settings": _settings_get(subdomain)})
-
-    data = request.get_json(silent=True) or {}
-    subdomain = (data.get("subdomain") or "").strip()
-    if not subdomain:
-        return _json_ok({"ok": False, "error": "missing_subdomain"}, 400)
-
-    prev = _settings_get(subdomain) or {}
-    new_settings = {
-        "backend_url": (data.get("backend_url") or data.get("backendUrl") or prev.get("backend_url") or "").strip(),
-        "fio": (data.get("fio") or prev.get("fio") or "").strip(),
-        "email": (data.get("email") or prev.get("email") or "").strip(),
-        "phone": (data.get("phone") or prev.get("phone") or "").strip(),
-        "account_id": data.get("account_id") or data.get("accountId") or prev.get("account_id"),
-        "user_id": data.get("user_id") or data.get("userId") or prev.get("user_id"),
-        "updated_at": _now_iso(),
-    }
-
-    _settings_set(subdomain, _merge_settings(_settings_get(subdomain), new_settings))
-    log_event("settings_save", {"subdomain": subdomain, "settings": new_settings})
-
-    # send TG only if changed meaningful fields
-    changed = any((prev.get(k) or "") != (new_settings.get(k) or "") for k in ("backend_url", "fio", "email", "phone"))
-    if changed:
-        text = (
-            "🟨 Loss Control: настройки изменены\n"
-            f"subdomain: {subdomain}\n"
-            f"ФИО: {new_settings.get('fio')}\n"
-            f"Email: {new_settings.get('email')}\n"
-            f"Телефон: {new_settings.get('phone')}\n"
-            f"Backend URL: {new_settings.get('backend_url')}\n"
-        )
-        # (disabled) telegram notify here
-
-    return _json_ok({"ok": True, "saved": True, "changed": changed})
+    return jsonify({"ok": True})
 
 
 # ---------- OAuth ----------
 @app.get("/oauth/start")
 def oauth_start():
     if not AMO_CLIENT_ID:
-        return _json_ok({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}, 500)
+        return jsonify({"ok": False, "error": "missing_env", "details": "AMO_CLIENT_ID"}), 500
 
     subdomain = _infer_subdomain_from_request()
     state = secrets.token_urlsafe(16)
     if subdomain:
         _states_put(state, subdomain)
 
-    # mode=post_message is widely used by marketplace widgets
     url = f"{AMO_AUTH_URL}?client_id={AMO_CLIENT_ID}&state={state}&mode=post_message"
 
     if request.args.get("go") == "1":
         return redirect(url)
 
-    return _json_ok({"ok": True, "url": url, "state": state, "subdomain": subdomain})
+    return jsonify({"ok": True, "url": url, "state": state, "subdomain": subdomain})
 
 
 @app.get("/oauth/callback")
@@ -602,20 +537,16 @@ def oauth_callback():
 
     if not code:
         log_event("oauth_fail", {"reason": "no_code", "args": dict(request.args)})
-        return _json_ok({"ok": False, "error": "no_code"}, 400)
+        return jsonify({"ok": False, "error": "no_code"}), 400
 
     if not subdomain:
         log_event("oauth_fail", {"reason": "no_subdomain", "args": dict(request.args)})
-        return _json_ok({"ok": False, "error": "no_subdomain"}, 400)
+        return jsonify({"ok": False, "error": "no_subdomain"}), 400
 
     try:
         tok = _amo_token_exchange(subdomain, code)
         _tokens_set(subdomain, tok)
-        log_event("oauth_ok", {"subdomain": subdomain})
-
-        # optional TG
-        # (disabled) telegram notify here
-
+        log_event("oauth_ok", {"subdomain": subdomain, "referer": request.args.get("referer")})
         return (
             "<html><body style='font-family:Arial'>"
             "<h2>Аккаунт подключен ✅</h2>"
@@ -623,9 +554,10 @@ def oauth_callback():
             200,
             {"Content-Type": "text/html; charset=utf-8"},
         )
+
     except Exception as e:
-        log_event("oauth_error", {"subdomain": subdomain, "error": str(e)})
-        return _json_ok({"ok": False, "error": "internal_error", "details": str(e)}, 500)
+        log_event("oauth_error", {"subdomain": subdomain, "error": str(e), "args": dict(request.args)})
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 # ---------- API helpers for widget ----------
@@ -633,28 +565,28 @@ def oauth_callback():
 def api_users():
     subdomain = (request.args.get("subdomain") or "").strip()
     if not subdomain:
-        return _json_ok({"ok": False, "error": "missing_subdomain"}, 400)
+        return jsonify({"ok": False, "error": "missing_subdomain"}), 400
 
     try:
         users = _amo_list_paged(subdomain, "/api/v4/users", params={}, limit=DEFAULT_LIMIT, max_pages=10)
         simplified = [{"id": u.get("id"), "name": u.get("name")} for u in users if u.get("id")]
-        return _json_ok({"ok": True, "users": simplified})
+        return jsonify({"ok": True, "users": simplified})
     except Exception as e:
-        return _json_ok({"ok": False, "error": "internal_error", "details": str(e)}, 500)
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 @app.get("/api/loss_reasons")
 def api_loss_reasons():
     subdomain = (request.args.get("subdomain") or "").strip()
     if not subdomain:
-        return _json_ok({"ok": False, "error": "missing_subdomain"}, 400)
+        return jsonify({"ok": False, "error": "missing_subdomain"}), 400
 
     try:
         reasons = _amo_list_paged(subdomain, "/api/v4/leads/loss_reasons", params={}, limit=DEFAULT_LIMIT, max_pages=10)
         simplified = [{"id": r.get("id"), "name": r.get("name")} for r in reasons if r.get("id")]
-        return _json_ok({"ok": True, "reasons": simplified})
+        return jsonify({"ok": True, "reasons": simplified})
     except Exception as e:
-        return _json_ok({"ok": False, "error": "internal_error", "details": str(e)}, 500)
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 @app.post("/api/lead/set_loss_reason")
@@ -665,18 +597,15 @@ def api_set_loss_reason():
     loss_reason_id = data.get("loss_reason_id")
 
     if not subdomain or not lead_id or not loss_reason_id:
-        return _json_ok(
-            {"ok": False, "error": "missing_fields", "required": ["subdomain", "lead_id", "loss_reason_id"]},
-            400,
-        )
+        return jsonify({"ok": False, "error": "missing_fields", "required": ["subdomain", "lead_id", "loss_reason_id"]}), 400
 
     try:
         body = {"loss_reason_id": int(loss_reason_id)}
         _amo_request(subdomain, "PATCH", f"/api/v4/leads/{int(lead_id)}", json_body=body)
         log_event("lead_loss_reason_set", {"subdomain": subdomain, "lead_id": lead_id, "loss_reason_id": loss_reason_id})
-        return _json_ok({"ok": True})
+        return jsonify({"ok": True})
     except Exception as e:
-        return _json_ok({"ok": False, "error": "internal_error", "details": str(e)}, 500)
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 # ---------- Reports ----------
@@ -684,9 +613,8 @@ def api_set_loss_reason():
 def report_dashboard():
     """
     Returns:
-    - won deals (status_id=142) within closed_at range
-    - lost deals (status_id=143) within closed_at range, grouped by manager and loss reason
-    - stale deals: open deals with no recent events (>N days) AND no current tasks (or tasks overdue >N days)
+    - lost deals (status_id=143) for date range, grouped by manager and reason
+    - stale deals (risk): NOT closed, NO open tasks, and NO notes/tasks activity within N days
     """
     subdomain = (request.args.get("subdomain") or "").strip()
     date_from = (request.args.get("date_from") or "").strip()
@@ -695,11 +623,13 @@ def report_dashboard():
     manager_id = (request.args.get("manager_id") or "").strip()
 
     if not subdomain:
-        return _json_ok({"ok": False, "error": "missing_subdomain"}, 400)
+        return jsonify({"ok": False, "error": "missing_subdomain"}), 400
 
     ts_from = _to_ts(date_from) if date_from else 0
     ts_to = _to_ts(date_to, end_of_day=True) if date_to else 0
-    stale_ts_from = int(time.time()) - stale_days * 86400
+    stale_ts_cutoff = int(time.time()) - stale_days * 86400
+
+    warnings = []
 
     try:
         # dictionaries for names
@@ -709,54 +639,65 @@ def report_dashboard():
         reasons = _amo_list_paged(subdomain, "/api/v4/leads/loss_reasons", params={}, limit=DEFAULT_LIMIT, max_pages=10)
         reason_name = {r.get("id"): r.get("name") for r in reasons if r.get("id")}
 
-        # -------- closed leads (won/lost) --------
-        params_closed = {}
+        # -------- lost leads --------
+        params_lost = {}
         if ts_from:
-            params_closed["filter[closed_at][from]"] = ts_from
+            params_lost["filter[closed_at][from]"] = ts_from
         if ts_to:
-            params_closed["filter[closed_at][to]"] = ts_to
+            params_lost["filter[closed_at][to]"] = ts_to
 
-        closed = _amo_list_paged(subdomain, "/api/v4/leads", params=params_closed, limit=DEFAULT_LIMIT, max_pages=30)
+        closed = _amo_list_paged(subdomain, "/api/v4/leads", params=params_lost, limit=DEFAULT_LIMIT, max_pages=20)
 
         lost_leads = []
-        won_leads = []
         for l in closed:
-            sid = int(l.get("status_id") or 0)
-            if manager_id and str(l.get("responsible_user_id")) != manager_id:
-                continue
-            if sid == 143:
-                lost_leads.append(l)
-            elif sid == 142:
-                won_leads.append(l)
-
-        # -------- stale leads (v3) --------
-        # prefilter by updated_at older than N days (cheap), then refine by:
-        # - NO events in last N days
-        # - NO "current" open tasks (open task with complete_till >= now - N days)
-        params_candidates = {"filter[updated_at][to]": stale_ts_from}
-        candidates = _amo_list_paged(subdomain, "/api/v4/leads", params=params_candidates, limit=DEFAULT_LIMIT, max_pages=30)
-
-        open_candidates = []
-        for l in candidates:
-            sid = int(l.get("status_id") or 0)
-            if sid in (142, 143):
+            if int(l.get("status_id") or 0) != 143:
                 continue
             if manager_id and str(l.get("responsible_user_id")) != manager_id:
                 continue
-            open_candidates.append(l)
+            lost_leads.append(l)
 
-        lead_ids = [int(l.get("id") or 0) for l in open_candidates if l.get("id")]
-        lead_ids_set = set(lead_ids)
+        # -------- stale candidates --------
+        # 1) cheap prefilter: updated_at <= cutoff (same as v1), then we do deep check
+        params_stale_prefilter = {"filter[updated_at][to]": stale_ts_cutoff}
+        maybe_stale = _amo_list_paged(subdomain, "/api/v4/leads", params=params_stale_prefilter, limit=DEFAULT_LIMIT, max_pages=20)
 
-        leads_with_current_tasks = _lead_ids_with_current_tasks(subdomain, lead_ids, stale_days)
-        leads_with_recent_events = _lead_ids_with_recent_events(subdomain, list(lead_ids_set), stale_ts_from)
+        candidates = []
+        for l in maybe_stale:
+            sid = int(l.get("status_id") or 0)
+            if sid in (142, 143):  # closed win/loss
+                continue
+            if manager_id and str(l.get("responsible_user_id")) != manager_id:
+                continue
+            candidates.append(l)
 
-        stale_ids = lead_ids_set - leads_with_current_tasks - leads_with_recent_events
-        stale_leads = [l for l in open_candidates if int(l.get("id") or 0) in stale_ids]
+        # 2) deep check: "нет задач + нет активностей (notes/tasks) > N дней"
+        stale_leads = []
+        deep = candidates[:MAX_STALE_ACTIVITY_CHECK]
+        if len(candidates) > MAX_STALE_ACTIVITY_CHECK:
+            warnings.append(
+                f"Слишком много потенциально зависших сделок ({len(candidates)}). "
+                f"Для точной проверки задач/заметок обработано только первые {MAX_STALE_ACTIVITY_CHECK}. "
+                f"Увеличьте MAX_STALE_ACTIVITY_CHECK в Render env, если нужно."
+            )
+
+        for l in deep:
+            lid = int(l.get("id") or 0)
+            # If open tasks exist => NOT stale
+            if _lead_has_open_tasks(subdomain, lid):
+                continue
+
+            last_act = _lead_last_activity_ts(subdomain, l)
+            if last_act and last_act > stale_ts_cutoff:
+                continue
+
+            # stale
+            l["_lc_last_activity_ts"] = last_act
+            stale_leads.append(l)
 
         # group by manager
         def pack_lead(l, kind: str):
             lid = l.get("id")
+            last_act = int(l.get("_lc_last_activity_ts") or l.get("updated_at") or 0)
             return {
                 "id": lid,
                 "name": l.get("name") or f"Сделка #{lid}",
@@ -768,35 +709,31 @@ def report_dashboard():
                 "loss_reason_id": l.get("loss_reason_id"),
                 "loss_reason": reason_name.get(l.get("loss_reason_id"), "—") if kind == "lost" else None,
                 "updated_at": l.get("updated_at"),
-                "days_no_activity": _days_since(int(l.get("updated_at") or 0)),
+                "last_activity_ts": last_act,
+                "days_no_activity": _days_since(last_act),
                 "url": f"{_amo_base_url(subdomain)}/leads/detail/{lid}",
             }
 
         per_manager = {}
 
-        def ensure_pm(uid):
+        # lost aggregation
+        for l in lost_leads:
+            uid = l.get("responsible_user_id")
             key = str(uid)
-            if key not in per_manager:
-                per_manager[key] = {
+            pm = per_manager.setdefault(
+                key,
+                {
                     "manager_id": uid,
                     "manager_name": user_name.get(uid) or str(uid),
-                    "won_count": 0,
-                    "won_sum": 0,
-                    "won_leads": [],
                     "lost_count": 0,
                     "lost_sum": 0,
-                    "lost_by_reason": {},  # name -> {count,sum}
+                    "lost_by_reason": {},  # reason_name -> {count,sum}
                     "lost_leads": [],
                     "stale_count": 0,
                     "stale_sum": 0,
                     "stale_leads": [],
-                }
-            return per_manager[key]
-
-        # lost
-        for l in lost_leads:
-            uid = l.get("responsible_user_id")
-            pm = ensure_pm(uid)
+                },
+            )
             price = int(l.get("price") or 0)
             pm["lost_count"] += 1
             pm["lost_sum"] += price
@@ -806,52 +743,56 @@ def report_dashboard():
             rb["sum"] += price
             pm["lost_leads"].append(pack_lead(l, "lost"))
 
-        # won
-        for l in won_leads:
-            uid = l.get("responsible_user_id")
-            pm = ensure_pm(uid)
-            price = int(l.get("price") or 0)
-            pm["won_count"] += 1
-            pm["won_sum"] += price
-            pm["won_leads"].append(pack_lead(l, "won"))
-
-        # stale
+        # stale aggregation
         for l in stale_leads:
             uid = l.get("responsible_user_id")
-            pm = ensure_pm(uid)
+            key = str(uid)
+            pm = per_manager.setdefault(
+                key,
+                {
+                    "manager_id": uid,
+                    "manager_name": user_name.get(uid) or str(uid),
+                    "lost_count": 0,
+                    "lost_sum": 0,
+                    "lost_by_reason": {},
+                    "lost_leads": [],
+                    "stale_count": 0,
+                    "stale_sum": 0,
+                    "stale_leads": [],
+                },
+            )
             price = int(l.get("price") or 0)
             pm["stale_count"] += 1
             pm["stale_sum"] += price
             pm["stale_leads"].append(pack_lead(l, "stale"))
 
-        # format & sort
+        # format lost_by_reason to list
         managers_list = []
         for pm in per_manager.values():
             reasons_list = [{"reason": k, "count": v["count"], "sum": v["sum"]} for k, v in pm["lost_by_reason"].items()]
             reasons_list.sort(key=lambda x: (-x["sum"], -x["count"], x["reason"]))
             pm["lost_by_reason"] = reasons_list
-
-            pm["won_leads"].sort(key=lambda x: (-x["price"], x["id"]))
             pm["lost_leads"].sort(key=lambda x: (-x["price"], x["id"]))
             pm["stale_leads"].sort(key=lambda x: (-x["price"], -x["days_no_activity"], x["id"]))
             managers_list.append(pm)
 
         managers_list.sort(
-            key=lambda x: (-(x["lost_sum"] + x["stale_sum"]), -(x["lost_count"] + x["stale_count"]), x["manager_name"])
+            key=lambda x: (
+                -(x["lost_sum"] + x["stale_sum"]),
+                -(x["lost_count"] + x["stale_count"]),
+                x["manager_name"],
+            )
         )
 
         totals = {
-            "won_count": sum(m.get("won_count", 0) for m in managers_list),
-            "won_sum": sum(m.get("won_sum", 0) for m in managers_list),
             "lost_count": sum(m["lost_count"] for m in managers_list),
             "lost_sum": sum(m["lost_sum"] for m in managers_list),
             "stale_count": sum(m["stale_count"] for m in managers_list),
             "stale_sum": sum(m["stale_sum"] for m in managers_list),
         }
         totals["total_risk_sum"] = totals["lost_sum"] + totals["stale_sum"]
-        totals["risk_open_stale_sum"] = totals["stale_sum"]
 
-        return _json_ok(
+        return jsonify(
             {
                 "ok": True,
                 "subdomain": subdomain,
@@ -859,15 +800,16 @@ def report_dashboard():
                 "date_to": date_to,
                 "stale_days": stale_days,
                 "manager_id": manager_id or None,
-                "settings": _settings_get(subdomain),
                 "totals": totals,
                 "managers": managers_list,
-                "note": "stale uses: no recent events (>N days) AND no current tasks (or tasks overdue >N days) (v3).",
+                "warnings": warnings,
+                "note": "stale=v2: no open tasks + no notes/tasks activity within N days; prefilter by lead.updated_at.",
             }
         )
+
     except Exception as e:
         log_event("report_error", {"error": str(e)})
-        return _json_ok({"ok": False, "error": "internal_error", "details": str(e)}, 500)
+        return jsonify({"ok": False, "error": "internal_error", "details": str(e)}), 500
 
 
 if __name__ == "__main__":
