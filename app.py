@@ -27,6 +27,39 @@ AMO_AUTH_URL = "https://www.amocrm.ru/oauth"
 DEFAULT_LIMIT = 100
 MAX_STALE_ACTIVITY_CHECK = int(os.environ.get("MAX_STALE_ACTIVITY_CHECK") or "200")  # max leads for deep check per request
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT") or "35")
+# Event types we consider as 'activity' for stale-deals detection
+RELEVANT_EVENT_TYPES = [
+  "task_added",
+  "task_completed",
+  "task_result_added",
+  "task_deadline_changed",
+  "task_text_changed",
+  "task_type_changed",
+  "incoming_call",
+  "outgoing_call",
+  "incoming_chat_message",
+  "outgoing_chat_message",
+  "entity_direct_message",
+  "incoming_sms",
+  "outgoing_sms",
+  "common_note_added",
+  "service_note_added",
+  "attachment_note_added",
+  "geo_note_added",
+  "site_visit_note_added",
+  "message_to_cashier_note_added",
+  "lead_status_changed",
+  "sale_field_changed",
+  "name_field_changed",
+  "custom_field_value_changed",
+  "entity_tag_added",
+  "entity_tag_deleted",
+  "entity_linked",
+  "entity_unlinked",
+  "entity_responsible_changed",
+  "robot_replied"
+]
+
 
 # =========================
 # Storage (Render-friendly)
@@ -351,15 +384,40 @@ def _lead_last_task_ts(subdomain: str, lead_id: int) -> int:
 def _lead_last_note_ts(subdomain: str, lead_id: int) -> int:
     """Returns timestamp (seconds) of the most recent note in the lead, or 0."""
     try:
-        params = {"limit": 1, "order[created_at]": "desc"}
+        # Notes list supports ordering by updated_at.
+        params = {"limit": 1, "order[updated_at]": "desc"}
         data = _amo_request(subdomain, "GET", f"/api/v4/leads/{int(lead_id)}/notes", params=params)
         notes = ((data.get("_embedded") or {}).get("notes") or [])
         if not notes:
             return 0
         n = notes[0] or {}
-        return int(n.get("created_at") or 0)
+        return int(n.get("updated_at") or n.get("created_at") or 0)
     except Exception:
         return 0
+
+def _lead_last_event_ts(subdomain: str, lead_id: int) -> int:
+    """Returns timestamp (seconds) of the most recent relevant event for the lead, or 0.
+
+    We use Events API with a filter by entity + entity_id and a shortlist of event types
+    that usually represent real "activity" in the lead timeline.
+    """
+    try:
+        params = {
+            "limit": 1,
+            "filter[entity]": "lead",
+            "filter[entity_id][]": [int(lead_id)],
+            "filter[type][]": RELEVANT_EVENT_TYPES,
+        }
+        data = _amo_request(subdomain, "GET", "/api/v4/events", params=params)
+        events = ((data.get("_embedded") or {}).get("events") or [])
+        if not events:
+            return 0
+        e = events[0] or {}
+        return int(e.get("created_at") or 0)
+    except Exception:
+        return 0
+
+
 
 
 def _lead_last_activity_ts(subdomain: str, lead: dict) -> int:
@@ -621,6 +679,7 @@ def report_dashboard():
     date_to = (request.args.get("date_to") or "").strip()
     stale_days = int(request.args.get("stale_days") or "7")
     manager_id = (request.args.get("manager_id") or "").strip()
+    pipeline_id = (request.args.get("pipeline_id") or "").strip()
 
     if not subdomain:
         return jsonify({"ok": False, "error": "missing_subdomain"}), 400
@@ -654,6 +713,8 @@ def report_dashboard():
                 continue
             if manager_id and str(l.get("responsible_user_id")) != manager_id:
                 continue
+            if pipeline_id and str(l.get("pipeline_id")) != pipeline_id:
+                continue
             lost_leads.append(l)
 
         # -------- stale candidates --------
@@ -667,6 +728,8 @@ def report_dashboard():
             if sid in (142, 143):  # closed win/loss
                 continue
             if manager_id and str(l.get("responsible_user_id")) != manager_id:
+                continue
+            if pipeline_id and str(l.get("pipeline_id")) != pipeline_id:
                 continue
             candidates.append(l)
 
@@ -686,7 +749,14 @@ def report_dashboard():
             if _lead_has_open_tasks(subdomain, lid):
                 continue
 
-            last_act = _lead_last_activity_ts(subdomain, l)
+            last_basic = _lead_last_activity_ts(subdomain, l)
+            if last_basic and last_basic > stale_ts_cutoff:
+                continue
+
+            # Extra check: also treat Events as activity (calls/chat/sms/notes/tasks/etc.)
+            last_evt = _lead_last_event_ts(subdomain, lid)
+            last_act = max(int(last_basic or 0), int(last_evt or 0))
+
             if last_act and last_act > stale_ts_cutoff:
                 continue
 
@@ -800,10 +870,11 @@ def report_dashboard():
                 "date_to": date_to,
                 "stale_days": stale_days,
                 "manager_id": manager_id or None,
+                "pipeline_id": pipeline_id or None,
                 "totals": totals,
                 "managers": managers_list,
                 "warnings": warnings,
-                "note": "stale=v2: no open tasks + no notes/tasks activity within N days; prefilter by lead.updated_at.",
+                "note": "stale=v2: no open tasks + no open tasks + no notes/tasks/events activity within N days; prefilter by lead.updated_at.",
             }
         )
 
